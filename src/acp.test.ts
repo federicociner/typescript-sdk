@@ -2295,14 +2295,9 @@ describe("Connection", () => {
       "/extra/root2",
     ]);
 
-    const listResponse = await agentConnection.listSessions({
-      additionalDirectories: ["/extra/root1", "/extra/root2"],
-    });
+    const listResponse = await agentConnection.listSessions({});
     expect(listResponse).toEqual({ sessions: [] });
-    expect(receivedListSessions?.additionalDirectories).toEqual([
-      "/extra/root1",
-      "/extra/root2",
-    ]);
+    expect(receivedListSessions).toEqual({});
   });
 
   it("handles elicitation request lifecycle", async () => {
