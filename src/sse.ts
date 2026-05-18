@@ -1,4 +1,5 @@
 import type { AnyMessage } from "./jsonrpc.js";
+import { isJsonRpcMessage } from "./jsonrpc.js";
 
 export function serializeSseEvent(msg: AnyMessage): string {
   return `data: ${JSON.stringify(msg)}\n\n`;
@@ -76,7 +77,7 @@ function parseSseEvent(eventPart: string): AnyMessage | undefined {
 
   try {
     const parsed: unknown = JSON.parse(data);
-    if (isAnyMessage(parsed)) {
+    if (isJsonRpcMessage(parsed)) {
       return parsed;
     }
 
@@ -86,20 +87,4 @@ function parseSseEvent(eventPart: string): AnyMessage | undefined {
     console.warn("Failed to parse SSE JSON payload:", error);
     return undefined;
   }
-}
-
-function isAnyMessage(value: unknown): value is AnyMessage {
-  if (!isRecord(value) || value["jsonrpc"] !== "2.0") {
-    return false;
-  }
-
-  if ("method" in value) {
-    return typeof value["method"] === "string";
-  }
-
-  return "id" in value;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
 }

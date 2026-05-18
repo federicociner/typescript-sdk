@@ -29,6 +29,10 @@
       "types": "./dist/acp.d.ts",
       "default": "./dist/acp.js"
     },
+    "./http-client": {
+      "types": "./dist/http-stream.d.ts",
+      "default": "./dist/http-stream.js"
+    },
     "./server": {
       "types": "./dist/server.d.ts",
       "default": "./dist/server.js"

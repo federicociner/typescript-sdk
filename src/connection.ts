@@ -1,5 +1,10 @@
 import { AgentSideConnection } from "./acp.js";
-import { messageIdKey, sessionIdFromParams } from "./protocol.js";
+import { isResponseMessage } from "./jsonrpc.js";
+import {
+  messageIdKey,
+  sessionIdFromMessageParams,
+  sessionIdFromResponseResult,
+} from "./protocol.js";
 
 import type { Agent } from "./acp.js";
 import type { AnyMessage, AnyResponse } from "./jsonrpc.js";
@@ -199,7 +204,7 @@ export class ConnectionState {
   private routeOutbound(message: AnyMessage): void {
     this.allOutbound.push(message);
 
-    if (isResponse(message)) {
+    if (isResponseMessage(message)) {
       this.routeOutboundResponse(message);
       return;
     }
@@ -210,9 +215,7 @@ export class ConnectionState {
   private routeOutboundResponse(message: AnyResponse): void {
     const key = messageIdKey(message.id);
     const route = key ? this.pendingRoutes.get(key) : undefined;
-    const sessionId = sessionIdFromResult(
-      "result" in message ? message.result : undefined,
-    );
+    const sessionId = sessionIdFromResponseResult(message);
 
     if (sessionId) {
       this.ensureSession(sessionId);
@@ -226,12 +229,10 @@ export class ConnectionState {
   }
 
   private routeOutboundRequestOrNotification(message: AnyMessage): void {
-    if ("method" in message) {
-      const sessionId = sessionIdFromParams(message.params);
-      if (sessionId) {
-        this.ensureSession(sessionId).push(message);
-        return;
-      }
+    const sessionId = sessionIdFromMessageParams(message);
+    if (sessionId) {
+      this.ensureSession(sessionId).push(message);
+      return;
     }
 
     this.connectionStream.push(message);
@@ -374,21 +375,4 @@ function isMatchingResponse(
   id: string | number,
 ): msg is AnyResponse {
   return "id" in msg && !("method" in msg) && msg.id === id;
-}
-
-function isResponse(msg: AnyMessage): msg is AnyResponse {
-  return "id" in msg && !("method" in msg);
-}
-
-function sessionIdFromResult(result: unknown): string | undefined {
-  if (!isRecord(result)) {
-    return undefined;
-  }
-
-  const sessionId = result["sessionId"];
-  return typeof sessionId === "string" ? sessionId : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
 }

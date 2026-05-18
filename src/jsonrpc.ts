@@ -44,3 +44,33 @@ export type NotificationHandler = (
   method: string,
   params: unknown,
 ) => Promise<void>;
+
+export function isJsonRpcMessage(value: unknown): value is AnyMessage {
+  if (!isRecord(value) || value["jsonrpc"] !== "2.0") {
+    return false;
+  }
+
+  if ("method" in value) {
+    return typeof value["method"] === "string";
+  }
+
+  return "id" in value;
+}
+
+export function isRequestMessage(message: AnyMessage): message is AnyRequest {
+  return "id" in message && "method" in message;
+}
+
+export function isResponseMessage(message: AnyMessage): message is AnyResponse {
+  return "id" in message && !("method" in message);
+}
+
+export function isNotificationMessage(
+  message: AnyMessage,
+): message is AnyNotification {
+  return "method" in message && !("id" in message);
+}
+
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}

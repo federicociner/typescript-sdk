@@ -1,5 +1,5 @@
 import { AGENT_METHODS } from "./schema/index.js";
-
+import { isRecord, isResponseMessage } from "./jsonrpc.js";
 import type { AnyMessage } from "./jsonrpc.js";
 
 export const HEADER_CONNECTION_ID = "Acp-Connection-Id";
@@ -31,6 +31,27 @@ export function sessionIdFromParams(params: unknown): string | undefined {
   return typeof sessionId === "string" ? sessionId : undefined;
 }
 
+export function sessionIdFromMessageParams(
+  message: AnyMessage,
+): string | undefined {
+  return "method" in message ? sessionIdFromParams(message.params) : undefined;
+}
+
+export function sessionIdFromResponseResult(
+  message: AnyMessage,
+): string | undefined {
+  if (!isResponseMessage(message) || !("result" in message)) {
+    return undefined;
+  }
+
+  if (!isRecord(message.result)) {
+    return undefined;
+  }
+
+  const sessionId = message.result["sessionId"];
+  return typeof sessionId === "string" ? sessionId : undefined;
+}
+
 export function isInitializeRequest(msg: AnyMessage): boolean {
   return (
     msg.jsonrpc === "2.0" &&
@@ -52,8 +73,4 @@ export function messageIdKey(
   }
 
   return undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
 }

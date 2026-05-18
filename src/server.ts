@@ -9,6 +9,11 @@ import {
   methodRequiresSessionHeader,
   sessionIdFromParams,
 } from "./protocol.js";
+import {
+  isJsonRpcMessage,
+  isRequestMessage,
+  isResponseMessage,
+} from "./jsonrpc.js";
 
 import { serializeSseEvent, serializeSseKeepAlive } from "./sse.js";
 
@@ -18,7 +23,7 @@ import type {
   ResponseRoute,
 } from "./connection.js";
 import type { Agent, AgentSideConnection } from "./acp.js";
-import type { AnyMessage, AnyResponse } from "./jsonrpc.js";
+import type { AnyMessage, AnyRequest, AnyResponse } from "./jsonrpc.js";
 
 export interface AcpServerOptions {
   createAgent: (conn: AgentSideConnection) => Agent;
@@ -237,11 +242,7 @@ type RouteResult =
       message: string;
     };
 
-type ClientRequestMessage = AnyMessage & {
-  readonly id: string | number | null;
-  readonly method: string;
-  readonly params?: unknown;
-};
+type ClientRequestMessage = AnyRequest;
 
 async function readJson(req: Request): Promise<JsonResult> {
   try {
@@ -344,28 +345,6 @@ function determineRoute(
     ok: true,
     value: "connection",
   };
-}
-
-function isJsonRpcMessage(value: unknown): value is AnyMessage {
-  return (
-    isRecord(value) &&
-    value.jsonrpc === "2.0" &&
-    ("method" in value || "id" in value)
-  );
-}
-
-function isRequestMessage(
-  message: AnyMessage,
-): message is ClientRequestMessage {
-  return "method" in message && "id" in message;
-}
-
-function isResponseMessage(message: AnyMessage): message is AnyResponse {
-  return "id" in message && !("method" in message);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
 }
 
 function sseResponse(subscription: OutboundSubscription): Response {
