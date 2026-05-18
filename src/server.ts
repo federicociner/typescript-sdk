@@ -14,8 +14,9 @@ import {
   isRequestMessage,
   isResponseMessage,
 } from "./jsonrpc.js";
-
 import { serializeSseEvent, serializeSseKeepAlive } from "./sse.js";
+import { handleWebSocketConnection } from "./ws-server.js";
+import type { WebSocketServerSocket } from "./ws-server.js";
 
 import type {
   ConnectionState,
@@ -51,6 +52,13 @@ export class AcpServer {
     }
 
     return textResponse("Method Not Allowed", 405);
+  }
+
+  handleWebSocket(socket: WebSocketServerSocket): void {
+    handleWebSocketConnection(socket, {
+      registry: this.registry,
+      createAgent: this.createAgent,
+    });
   }
 
   async close(): Promise<void> {
