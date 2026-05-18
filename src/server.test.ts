@@ -1,9 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { HEADER_CONNECTION_ID, JSON_MIME_TYPE } from "./protocol.js";
-import { startTestServer } from "./test-support/test-http-server.js";
+import {
+  EVENT_STREAM_MIME_TYPE,
+  HEADER_CONNECTION_ID,
+  HEADER_SESSION_ID,
+  JSON_MIME_TYPE,
+} from "./protocol.js";
+import { AcpServer } from "./server.js";
+import { parseSseStream } from "./sse.js";
 import { TestAgent } from "./test-support/test-agent.js";
+import { startTestServer } from "./test-support/test-http-server.js";
 
 import type { AgentSideConnection } from "./acp.js";
+import type { AnyMessage } from "./jsonrpc.js";
 
 const initializeRequest = {
   jsonrpc: "2.0",
@@ -12,6 +20,16 @@ const initializeRequest = {
   params: {
     protocolVersion: 1,
     clientCapabilities: {},
+  },
+};
+
+const sessionNewRequest = {
+  jsonrpc: "2.0",
+  id: 2,
+  method: "session/new",
+  params: {
+    cwd: "/tmp",
+    mcpServers: [],
   },
 };
 
@@ -42,20 +60,223 @@ describe("AcpServer", () => {
     }
   });
 
-  it.each(["GET", "PUT", "PATCH", "DELETE"])(
-    "rejects %s requests in Phase 1",
-    async (method) => {
-      const server = await startTestServer();
+  it("streams session/new responses over the connection SSE stream", async () => {
+    const server = await startTestServer();
 
-      try {
-        const response = await fetch(server.url, { method });
+    try {
+      const connectionId = await initialize(server.url);
+      const sseResponse = await openConnectionSse(server.url, connectionId);
 
-        expect(response.status).toBe(405);
-      } finally {
-        await server.close();
-      }
-    },
-  );
+      expect(sseResponse.status).toBe(200);
+      expect(sseResponse.headers.get("Content-Type")).toContain(
+        EVENT_STREAM_MIME_TYPE,
+      );
+
+      const accepted = await postJson(server.url, sessionNewRequest, {
+        [HEADER_CONNECTION_ID]: connectionId,
+      });
+
+      expect(accepted.status).toBe(202);
+      expect(await accepted.text()).toBe("");
+      expect(await readFirstSseMessage(sseResponse)).toMatchObject({
+        jsonrpc: "2.0",
+        id: sessionNewRequest.id,
+        result: {
+          sessionId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+        },
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("replays buffered connection messages when SSE attaches after POST", async () => {
+    const server = await startTestServer();
+
+    try {
+      const connectionId = await initialize(server.url);
+      const accepted = await postJson(server.url, sessionNewRequest, {
+        [HEADER_CONNECTION_ID]: connectionId,
+      });
+
+      expect(accepted.status).toBe(202);
+
+      const sseResponse = await openConnectionSse(server.url, connectionId);
+
+      expect(await readFirstSseMessage(sseResponse)).toMatchObject({
+        jsonrpc: "2.0",
+        id: sessionNewRequest.id,
+        result: {
+          sessionId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+        },
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it.each(["PUT", "PATCH"])("rejects %s requests", async (method) => {
+    const server = await startTestServer();
+
+    try {
+      const response = await fetch(server.url, { method });
+
+      expect(response.status).toBe(405);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects GET without Accept: text/event-stream", async () => {
+    const server = await startTestServer();
+
+    try {
+      const response = await fetch(server.url, {
+        method: "GET",
+        headers: {
+          [HEADER_CONNECTION_ID]: globalThis.crypto.randomUUID(),
+        },
+      });
+
+      expect(response.status).toBe(406);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects GET without a connection ID", async () => {
+    const server = await startTestServer();
+
+    try {
+      const response = await fetch(server.url, {
+        method: "GET",
+        headers: {
+          Accept: EVENT_STREAM_MIME_TYPE,
+        },
+      });
+
+      expect(response.status).toBe(400);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects GET with an unknown connection ID", async () => {
+    const server = await startTestServer();
+
+    try {
+      const response = await openConnectionSse(
+        server.url,
+        globalThis.crypto.randomUUID(),
+      );
+
+      expect(response.status).toBe(404);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects session-scoped GETs until session SSE is implemented", async () => {
+    const server = await startTestServer();
+
+    try {
+      const connectionId = await initialize(server.url);
+      const response = await fetch(server.url, {
+        method: "GET",
+        headers: {
+          Accept: EVENT_STREAM_MIME_TYPE,
+          [HEADER_CONNECTION_ID]: connectionId,
+          [HEADER_SESSION_ID]: globalThis.crypto.randomUUID(),
+        },
+      });
+
+      expect(response.status).toBe(404);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("returns 426 for WebSocket upgrade GETs", async () => {
+    const server = new AcpServer({
+      createAgent: (conn: AgentSideConnection) => new TestAgent(conn),
+    });
+
+    try {
+      const response = await server.handleRequest(
+        new Request("http://127.0.0.1/acp", {
+          method: "GET",
+          headers: {
+            Accept: EVENT_STREAM_MIME_TYPE,
+            Upgrade: "websocket",
+          },
+        }),
+      );
+
+      expect(response.status).toBe(426);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("deletes connections and closes SSE streams", async () => {
+    const server = await startTestServer();
+
+    try {
+      const connectionId = await initialize(server.url);
+      const sseResponse = await openConnectionSse(server.url, connectionId);
+      const reader = sseResponse.body?.getReader();
+
+      expect(reader).toBeDefined();
+
+      const deleted = await fetch(server.url, {
+        method: "DELETE",
+        headers: {
+          [HEADER_CONNECTION_ID]: connectionId,
+        },
+      });
+
+      expect(deleted.status).toBe(202);
+      expect(await reader?.read()).toEqual({ done: true, value: undefined });
+      reader?.releaseLock();
+
+      const postAfterDelete = await postJson(server.url, sessionNewRequest, {
+        [HEADER_CONNECTION_ID]: connectionId,
+      });
+
+      expect(postAfterDelete.status).toBe(404);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects DELETE without a connection ID", async () => {
+    const server = await startTestServer();
+
+    try {
+      const response = await fetch(server.url, { method: "DELETE" });
+
+      expect(response.status).toBe(400);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects DELETE with an unknown connection ID", async () => {
+    const server = await startTestServer();
+
+    try {
+      const response = await fetch(server.url, {
+        method: "DELETE",
+        headers: {
+          [HEADER_CONNECTION_ID]: globalThis.crypto.randomUUID(),
+        },
+      });
+
+      expect(response.status).toBe(404);
+    } finally {
+      await server.close();
+    }
+  });
 
   it("rejects POST without application/json Content-Type", async () => {
     const server = await startTestServer();
@@ -127,15 +348,7 @@ describe("AcpServer", () => {
     const server = await startTestServer();
 
     try {
-      const response = await postJson(server.url, {
-        jsonrpc: "2.0",
-        id: 2,
-        method: "session/new",
-        params: {
-          cwd: "/tmp",
-          mcpServers: [],
-        },
-      });
+      const response = await postJson(server.url, sessionNewRequest);
 
       expect(response.status).toBe(400);
     } finally {
@@ -147,54 +360,11 @@ describe("AcpServer", () => {
     const server = await startTestServer();
 
     try {
-      const response = await postJson(
-        server.url,
-        {
-          jsonrpc: "2.0",
-          id: 2,
-          method: "session/new",
-          params: {
-            cwd: "/tmp",
-            mcpServers: [],
-          },
-        },
-        {
-          [HEADER_CONNECTION_ID]: globalThis.crypto.randomUUID(),
-        },
-      );
+      const response = await postJson(server.url, sessionNewRequest, {
+        [HEADER_CONNECTION_ID]: globalThis.crypto.randomUUID(),
+      });
 
       expect(response.status).toBe(404);
-    } finally {
-      await server.close();
-    }
-  });
-
-  it("rejects connected POSTs after initialize in Phase 1", async () => {
-    const server = await startTestServer();
-
-    try {
-      const initializeResponse = await postJson(server.url, initializeRequest);
-      const connectionId = initializeResponse.headers.get(HEADER_CONNECTION_ID);
-
-      expect(connectionId).toBeTruthy();
-
-      const response = await postJson(
-        server.url,
-        {
-          jsonrpc: "2.0",
-          id: 2,
-          method: "session/new",
-          params: {
-            cwd: "/tmp",
-            mcpServers: [],
-          },
-        },
-        {
-          [HEADER_CONNECTION_ID]: connectionId ?? "",
-        },
-      );
-
-      expect(response.status).toBe(400);
     } finally {
       await server.close();
     }
@@ -257,6 +427,46 @@ describe("AcpServer", () => {
     }
   });
 });
+
+async function initialize(url: string): Promise<string> {
+  const response = await postJson(url, initializeRequest);
+  const connectionId = response.headers.get(HEADER_CONNECTION_ID);
+
+  expect(response.status).toBe(200);
+  expect(connectionId).toMatch(/^[0-9a-f-]{36}$/);
+
+  return connectionId ?? "";
+}
+
+function openConnectionSse(
+  url: string,
+  connectionId: string,
+): Promise<Response> {
+  return fetch(url, {
+    method: "GET",
+    headers: {
+      Accept: EVENT_STREAM_MIME_TYPE,
+      [HEADER_CONNECTION_ID]: connectionId,
+    },
+  });
+}
+
+async function readFirstSseMessage(response: Response): Promise<AnyMessage> {
+  if (!response.body) {
+    throw new Error("Expected SSE response body");
+  }
+
+  const iterator = parseSseStream(response.body)[Symbol.asyncIterator]();
+  const result = await iterator.next();
+  await iterator.return?.();
+  await response.body.cancel();
+
+  if (result.done) {
+    throw new Error("Expected SSE message");
+  }
+
+  return result.value;
+}
 
 function postJson(
   url: string,

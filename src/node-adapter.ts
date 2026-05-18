@@ -88,6 +88,8 @@ async function writeNodeResponse(
     res.setHeader(name, value);
   });
 
+  res.flushHeaders();
+
   const responseBody = response.body;
 
   if (!responseBody) {

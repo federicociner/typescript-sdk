@@ -1,10 +1,19 @@
 import { ConnectionRegistry } from "./connection.js";
 import {
+  EVENT_STREAM_MIME_TYPE,
   HEADER_CONNECTION_ID,
+  HEADER_SESSION_ID,
   JSON_MIME_TYPE,
   isInitializeRequest,
+  messageIdKey,
 } from "./protocol.js";
+import { serializeSseEvent, serializeSseKeepAlive } from "./sse.js";
 
+import type {
+  ConnectionState,
+  OutboundSubscription,
+  ResponseRoute,
+} from "./connection.js";
 import type { Agent, AgentSideConnection } from "./acp.js";
 import type { AnyMessage } from "./jsonrpc.js";
 
@@ -21,10 +30,26 @@ export class AcpServer {
   }
 
   async handleRequest(req: Request): Promise<Response> {
-    if (req.method !== "POST") {
-      return textResponse("Method Not Allowed", 405);
+    if (req.method === "POST") {
+      return await this.handlePost(req);
     }
 
+    if (req.method === "GET") {
+      return this.handleGet(req);
+    }
+
+    if (req.method === "DELETE") {
+      return this.handleDelete(req);
+    }
+
+    return textResponse("Method Not Allowed", 405);
+  }
+
+  async close(): Promise<void> {
+    this.registry.closeAll();
+  }
+
+  private async handlePost(req: Request): Promise<Response> {
     const contentType = req.headers.get("Content-Type");
 
     if (!contentType?.startsWith(JSON_MIME_TYPE)) {
@@ -55,18 +80,58 @@ export class AcpServer {
       return textResponse("Missing Acp-Connection-Id", 400);
     }
 
-    if (!this.registry.get(connectionId)) {
+    const connection = this.registry.get(connectionId);
+
+    if (!connection) {
       return textResponse("Unknown Acp-Connection-Id", 404);
     }
 
-    return textResponse(
-      "Connected POST handling is not implemented in Phase 1",
-      400,
-    );
+    await this.forwardConnectedMessage(connection, body.value);
+    return emptyResponse(202);
   }
 
-  async close(): Promise<void> {
-    this.registry.closeAll();
+  private handleGet(req: Request): Response {
+    if (req.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+      return textResponse("WebSocket upgrade is not implemented", 426);
+    }
+
+    const accept = req.headers.get("Accept")?.toLowerCase();
+
+    if (!accept?.includes(EVENT_STREAM_MIME_TYPE)) {
+      return textResponse("Not Acceptable", 406);
+    }
+
+    const connectionId = req.headers.get(HEADER_CONNECTION_ID);
+
+    if (!connectionId) {
+      return textResponse("Missing Acp-Connection-Id", 400);
+    }
+
+    const connection = this.registry.get(connectionId);
+
+    if (!connection) {
+      return textResponse("Unknown Acp-Connection-Id", 404);
+    }
+
+    if (req.headers.get(HEADER_SESSION_ID)) {
+      return textResponse("Unknown Acp-Session-Id", 404);
+    }
+
+    return sseResponse(connection.connectionStream.subscribe());
+  }
+
+  private handleDelete(req: Request): Response {
+    const connectionId = req.headers.get(HEADER_CONNECTION_ID);
+
+    if (!connectionId) {
+      return textResponse("Missing Acp-Connection-Id", 400);
+    }
+
+    if (!this.registry.remove(connectionId)) {
+      return textResponse("Unknown Acp-Connection-Id", 404);
+    }
+
+    return emptyResponse(202);
   }
 
   private async handleInitialize(message: AnyMessage): Promise<Response> {
@@ -80,15 +145,10 @@ export class AcpServer {
 
     try {
       connection = this.registry.createConnection(this.createAgent);
-      const writer = connection.inboundTx.getWriter();
-
-      try {
-        await writer.write(message);
-      } finally {
-        writer.releaseLock();
-      }
+      await writeInbound(connection, message);
 
       const initialResponse = await connection.recvInitial(message.id);
+      connection.startRouter();
 
       return jsonResponse(initialResponse, 200, {
         [HEADER_CONNECTION_ID]: connection.connectionId,
@@ -111,6 +171,21 @@ export class AcpServer {
         500,
       );
     }
+  }
+
+  private async forwardConnectedMessage(
+    connection: ConnectionState,
+    message: AnyMessage,
+  ): Promise<void> {
+    if (isRequestMessage(message)) {
+      const key = messageIdKey(message.id);
+
+      if (key) {
+        connection.pendingRoutes.set(key, determineRoute());
+      }
+    }
+
+    await writeInbound(connection, message);
   }
 }
 
@@ -136,6 +211,23 @@ async function readJson(req: Request): Promise<JsonResult> {
   }
 }
 
+async function writeInbound(
+  connection: ConnectionState,
+  message: AnyMessage,
+): Promise<void> {
+  const writer = connection.inboundTx.getWriter();
+
+  try {
+    await writer.write(message);
+  } finally {
+    writer.releaseLock();
+  }
+}
+
+function determineRoute(): ResponseRoute {
+  return "connection";
+}
+
 function isJsonRpcMessage(value: unknown): value is AnyMessage {
   return (
     isRecord(value) &&
@@ -144,8 +236,99 @@ function isJsonRpcMessage(value: unknown): value is AnyMessage {
   );
 }
 
+function isRequestMessage(
+  message: AnyMessage,
+): message is AnyMessage & { readonly id: string | number | null } {
+  return "method" in message && "id" in message;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function sseResponse(subscription: OutboundSubscription): Response {
+  return new Response(createSseBody(subscription), {
+    status: 200,
+    headers: {
+      "Content-Type": EVENT_STREAM_MIME_TYPE,
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
+}
+
+function createSseBody(
+  subscription: OutboundSubscription,
+): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
+  let reader: ReadableStreamDefaultReader<AnyMessage> | undefined;
+
+  const clearKeepAlive = (): void => {
+    if (keepAliveTimer) {
+      clearInterval(keepAliveTimer);
+      keepAliveTimer = undefined;
+    }
+  };
+
+  const enqueueText = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    text: string,
+  ): boolean => {
+    try {
+      controller.enqueue(encoder.encode(text));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      for (const message of subscription.replay) {
+        if (!enqueueText(controller, serializeSseEvent(message))) {
+          return;
+        }
+      }
+
+      reader = subscription.stream.getReader();
+
+      keepAliveTimer = setInterval(() => {
+        if (!enqueueText(controller, serializeSseKeepAlive())) {
+          clearKeepAlive();
+        }
+      }, 15_000);
+
+      try {
+        while (true) {
+          const result = await reader.read();
+
+          if (result.done) {
+            return;
+          }
+
+          if (!enqueueText(controller, serializeSseEvent(result.value))) {
+            return;
+          }
+        }
+      } catch (error) {
+        controller.error(error);
+      } finally {
+        clearKeepAlive();
+        reader.releaseLock();
+
+        try {
+          controller.close();
+        } catch {
+          // Stream may already be cancelled by the consumer.
+        }
+      }
+    },
+    cancel() {
+      clearKeepAlive();
+      void reader?.cancel();
+    },
+  });
 }
 
 function jsonResponse(
@@ -169,4 +352,8 @@ function textResponse(body: string, status: number): Response {
       "Content-Type": "text/plain",
     },
   });
+}
+
+function emptyResponse(status: number): Response {
+  return new Response(null, { status });
 }

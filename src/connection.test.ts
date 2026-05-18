@@ -1,8 +1,14 @@
-import { describe, expect, it } from "vitest";
-import { ConnectionRegistry } from "./connection.js";
+import { describe, expect, it, vi } from "vitest";
+import {
+  ConnectionRegistry,
+  OutboundStream,
+  type ResponseRoute,
+} from "./connection.js";
+import { messageIdKey } from "./protocol.js";
 import { TestAgent } from "./test-support/test-agent.js";
 
 import type { AgentSideConnection } from "./acp.js";
+import type { AnyMessage } from "./jsonrpc.js";
 
 const initializeRequest = {
   jsonrpc: "2.0",
@@ -13,6 +19,21 @@ const initializeRequest = {
     clientCapabilities: {},
   },
 } as const;
+
+const sessionNewRequest = {
+  jsonrpc: "2.0",
+  id: 2,
+  method: "session/new",
+  params: {
+    cwd: "/tmp",
+    mcpServers: [],
+  },
+} as const;
+
+const messageOne = { jsonrpc: "2.0", id: 1, result: "one" } as const;
+const messageTwo = { jsonrpc: "2.0", id: 2, result: "two" } as const;
+const messageThree = { jsonrpc: "2.0", id: 3, result: "three" } as const;
+const messageFour = { jsonrpc: "2.0", id: 4, result: "four" } as const;
 
 describe("ConnectionRegistry", () => {
   it("creates retrievable connections with unique UUID connection IDs", () => {
@@ -49,13 +70,8 @@ describe("ConnectionRegistry", () => {
     const connection = registry.createConnection(
       (conn: AgentSideConnection) => new TestAgent(conn),
     );
-    const writer = connection.inboundTx.getWriter();
 
-    try {
-      await writer.write(initializeRequest);
-    } finally {
-      writer.releaseLock();
-    }
+    await writeInbound(connection.inboundTx, initializeRequest);
 
     const response = await connection.recvInitial(initializeRequest.id);
 
@@ -72,4 +88,168 @@ describe("ConnectionRegistry", () => {
 
     registry.closeAll();
   });
+
+  it("routes pending responses to the connection stream and all outbound stream", async () => {
+    const registry = new ConnectionRegistry();
+    const connection = registry.createConnection(
+      (conn: AgentSideConnection) => new TestAgent(conn),
+    );
+
+    await initializeConnection(connection);
+
+    const connectionSubscription = connection.connectionStream.subscribe();
+    const allOutboundSubscription = connection.allOutbound.subscribe();
+    const key = messageIdKey(sessionNewRequest.id);
+
+    expect(key).toBe("number:2");
+    connection.pendingRoutes.set(key ?? "", "connection");
+
+    await writeInbound(connection.inboundTx, sessionNewRequest);
+
+    const connectionMessage = await readNext(connectionSubscription.stream);
+    const allOutboundMessage = await readNext(allOutboundSubscription.stream);
+
+    expect(connectionMessage).toMatchObject({
+      jsonrpc: "2.0",
+      id: sessionNewRequest.id,
+      result: {
+        sessionId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      },
+    });
+    expect(allOutboundMessage).toMatchObject(connectionMessage);
+    expect(connection.pendingRoutes.has(key ?? "")).toBe(false);
+
+    registry.closeAll();
+  });
+
+  it("falls back to the connection stream for responses without a pending route", async () => {
+    const registry = new ConnectionRegistry();
+    const connection = registry.createConnection(
+      (conn: AgentSideConnection) => new TestAgent(conn),
+    );
+
+    await initializeConnection(connection);
+
+    const subscription = connection.connectionStream.subscribe();
+
+    await writeInbound(connection.inboundTx, sessionNewRequest);
+
+    expect(await readNext(subscription.stream)).toMatchObject({
+      jsonrpc: "2.0",
+      id: sessionNewRequest.id,
+      result: {
+        sessionId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      },
+    });
+
+    registry.closeAll();
+  });
 });
+
+describe("OutboundStream", () => {
+  it("replays buffered messages to the first subscriber", () => {
+    const stream = new OutboundStream();
+
+    stream.push(messageOne);
+    stream.push(messageTwo);
+
+    expect(stream.subscribe().replay).toEqual([messageOne, messageTwo]);
+  });
+
+  it("does not replay buffered messages to later subscribers", async () => {
+    const stream = new OutboundStream();
+
+    stream.push(messageOne);
+
+    const first = stream.subscribe();
+    const second = stream.subscribe();
+
+    expect(first.replay).toEqual([messageOne]);
+    expect(second.replay).toEqual([]);
+
+    stream.push(messageTwo);
+
+    expect(await readNext(first.stream)).toEqual(messageTwo);
+    expect(await readNext(second.stream)).toEqual(messageTwo);
+  });
+
+  it("evicts oldest replay messages when capacity is exceeded", () => {
+    const stream = new OutboundStream(2);
+
+    stream.push(messageOne);
+    stream.push(messageTwo);
+    stream.push(messageThree);
+
+    expect(stream.subscribe().replay).toEqual([messageTwo, messageThree]);
+  });
+
+  it("drops oldest queued live messages for lagging subscribers", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const stream = new OutboundStream(2);
+    const subscription = stream.subscribe();
+
+    stream.push(messageOne);
+    stream.push(messageTwo);
+    stream.push(messageThree);
+    stream.push(messageFour);
+
+    expect(await readNext(subscription.stream)).toEqual(messageOne);
+    expect(await readNext(subscription.stream)).toEqual(messageThree);
+    expect(await readNext(subscription.stream)).toEqual(messageFour);
+    expect(warn).toHaveBeenCalledOnce();
+
+    warn.mockRestore();
+  });
+
+  it("closes subscriber streams", async () => {
+    const stream = new OutboundStream();
+    const reader = stream.subscribe().stream.getReader();
+
+    stream.close();
+
+    expect(await reader.read()).toEqual({ done: true, value: undefined });
+    reader.releaseLock();
+  });
+});
+
+type TestConnection = ReturnType<ConnectionRegistry["createConnection"]>;
+
+async function initializeConnection(connection: TestConnection): Promise<void> {
+  await writeInbound(connection.inboundTx, initializeRequest);
+  await connection.recvInitial(initializeRequest.id);
+  connection.startRouter();
+}
+
+async function writeInbound(
+  stream: WritableStream<AnyMessage>,
+  message: AnyMessage,
+): Promise<void> {
+  const writer = stream.getWriter();
+
+  try {
+    await writer.write(message);
+  } finally {
+    writer.releaseLock();
+  }
+}
+
+async function readNext(
+  stream: ReadableStream<AnyMessage>,
+): Promise<AnyMessage> {
+  const reader = stream.getReader();
+
+  try {
+    const result = await reader.read();
+
+    if (result.done) {
+      throw new Error("Expected stream message");
+    }
+
+    return result.value;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+const routeShapeCheck = "connection" satisfies ResponseRoute;
+void routeShapeCheck;
