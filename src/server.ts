@@ -18,7 +18,7 @@ import type {
   ResponseRoute,
 } from "./connection.js";
 import type { Agent, AgentSideConnection } from "./acp.js";
-import type { AnyMessage } from "./jsonrpc.js";
+import type { AnyMessage, AnyResponse } from "./jsonrpc.js";
 
 export interface AcpServerOptions {
   createAgent: (conn: AgentSideConnection) => Agent;
@@ -196,25 +196,14 @@ export class AcpServer {
     headers: Headers,
   ): Promise<ForwardResult> {
     if (isRequestMessage(message)) {
-      const route = determineRoute(message, headers);
-
-      if (!route.ok) {
-        return route;
-      }
-
-      if (route.value !== "connection") {
-        connection.ensureSession(route.value.session);
-      }
-
-      const key = messageIdKey(message.id);
-
-      if (key) {
-        connection.pendingRoutes.set(key, route.value);
-      }
+      return await forwardClientRequest(connection, message, headers);
     }
 
-    await writeInbound(connection, message);
-    return { ok: true };
+    if (isResponseMessage(message)) {
+      return await forwardClientResponse(connection, message);
+    }
+
+    return await forwardClientNotification(connection, message);
   }
 }
 
@@ -248,6 +237,12 @@ type RouteResult =
       message: string;
     };
 
+type ClientRequestMessage = AnyMessage & {
+  readonly id: string | number | null;
+  readonly method: string;
+  readonly params?: unknown;
+};
+
 async function readJson(req: Request): Promise<JsonResult> {
   try {
     return {
@@ -274,11 +269,49 @@ async function writeInbound(
   }
 }
 
+async function forwardClientRequest(
+  connection: ConnectionState,
+  message: ClientRequestMessage,
+  headers: Headers,
+): Promise<ForwardResult> {
+  const route = determineRoute(message, headers);
+
+  if (!route.ok) {
+    return route;
+  }
+
+  if (route.value !== "connection") {
+    connection.ensureSession(route.value.session);
+  }
+
+  const key = messageIdKey(message.id);
+
+  if (key) {
+    connection.pendingRoutes.set(key, route.value);
+  }
+
+  await writeInbound(connection, message);
+  return { ok: true };
+}
+
+async function forwardClientResponse(
+  connection: ConnectionState,
+  message: AnyResponse,
+): Promise<ForwardResult> {
+  await writeInbound(connection, message);
+  return { ok: true };
+}
+
+async function forwardClientNotification(
+  connection: ConnectionState,
+  message: AnyMessage,
+): Promise<ForwardResult> {
+  await writeInbound(connection, message);
+  return { ok: true };
+}
+
 function determineRoute(
-  message: AnyMessage & {
-    readonly method: string;
-    readonly params?: unknown;
-  },
+  message: ClientRequestMessage,
   headers: Headers,
 ): RouteResult {
   const headerSessionId = headers.get(HEADER_SESSION_ID);
@@ -321,12 +354,14 @@ function isJsonRpcMessage(value: unknown): value is AnyMessage {
   );
 }
 
-function isRequestMessage(message: AnyMessage): message is AnyMessage & {
-  readonly id: string | number | null;
-  readonly method: string;
-  readonly params?: unknown;
-} {
+function isRequestMessage(
+  message: AnyMessage,
+): message is ClientRequestMessage {
   return "method" in message && "id" in message;
+}
+
+function isResponseMessage(message: AnyMessage): message is AnyResponse {
+  return "id" in message && !("method" in message);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

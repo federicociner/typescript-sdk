@@ -200,24 +200,32 @@ export class ConnectionState {
     this.allOutbound.push(message);
 
     if (isResponse(message)) {
-      const key = messageIdKey(message.id);
-      const route = key ? this.pendingRoutes.get(key) : undefined;
-      const sessionId = sessionIdFromResult(
-        "result" in message ? message.result : undefined,
-      );
-
-      if (sessionId) {
-        this.ensureSession(sessionId);
-      }
-
-      if (key) {
-        this.pendingRoutes.delete(key);
-      }
-
-      this.pushToRoute(route ?? "connection", message);
+      this.routeOutboundResponse(message);
       return;
     }
 
+    this.routeOutboundRequestOrNotification(message);
+  }
+
+  private routeOutboundResponse(message: AnyResponse): void {
+    const key = messageIdKey(message.id);
+    const route = key ? this.pendingRoutes.get(key) : undefined;
+    const sessionId = sessionIdFromResult(
+      "result" in message ? message.result : undefined,
+    );
+
+    if (sessionId) {
+      this.ensureSession(sessionId);
+    }
+
+    if (key) {
+      this.pendingRoutes.delete(key);
+    }
+
+    this.pushToRoute(route ?? "connection", message);
+  }
+
+  private routeOutboundRequestOrNotification(message: AnyMessage): void {
     if ("method" in message) {
       const sessionId = sessionIdFromParams(message.params);
       if (sessionId) {
