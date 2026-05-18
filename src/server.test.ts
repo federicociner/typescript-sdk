@@ -176,19 +176,16 @@ describe("AcpServer", () => {
     }
   });
 
-  it("rejects session-scoped GETs until session SSE is implemented", async () => {
+  it("rejects session-scoped GETs for unknown sessions", async () => {
     const server = await startTestServer();
 
     try {
       const connectionId = await initialize(server.url);
-      const response = await fetch(server.url, {
-        method: "GET",
-        headers: {
-          Accept: EVENT_STREAM_MIME_TYPE,
-          [HEADER_CONNECTION_ID]: connectionId,
-          [HEADER_SESSION_ID]: globalThis.crypto.randomUUID(),
-        },
-      });
+      const response = await openSessionSse(
+        server.url,
+        connectionId,
+        globalThis.crypto.randomUUID(),
+      );
 
       expect(response.status).toBe(404);
     } finally {
@@ -447,6 +444,21 @@ function openConnectionSse(
     headers: {
       Accept: EVENT_STREAM_MIME_TYPE,
       [HEADER_CONNECTION_ID]: connectionId,
+    },
+  });
+}
+
+function openSessionSse(
+  url: string,
+  connectionId: string,
+  sessionId: string,
+): Promise<Response> {
+  return fetch(url, {
+    method: "GET",
+    headers: {
+      Accept: EVENT_STREAM_MIME_TYPE,
+      [HEADER_CONNECTION_ID]: connectionId,
+      [HEADER_SESSION_ID]: sessionId,
     },
   });
 }

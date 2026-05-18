@@ -6,7 +6,10 @@ import {
   JSON_MIME_TYPE,
   isInitializeRequest,
   messageIdKey,
+  methodRequiresSessionHeader,
+  sessionIdFromParams,
 } from "./protocol.js";
+
 import { serializeSseEvent, serializeSseKeepAlive } from "./sse.js";
 
 import type {
@@ -86,7 +89,15 @@ export class AcpServer {
       return textResponse("Unknown Acp-Connection-Id", 404);
     }
 
-    await this.forwardConnectedMessage(connection, body.value);
+    const forwarded = await this.forwardConnectedMessage(
+      connection,
+      body.value,
+      req.headers,
+    );
+    if (!forwarded.ok) {
+      return textResponse(forwarded.message, forwarded.status);
+    }
+
     return emptyResponse(202);
   }
 
@@ -113,8 +124,14 @@ export class AcpServer {
       return textResponse("Unknown Acp-Connection-Id", 404);
     }
 
-    if (req.headers.get(HEADER_SESSION_ID)) {
-      return textResponse("Unknown Acp-Session-Id", 404);
+    const sessionId = req.headers.get(HEADER_SESSION_ID);
+    if (sessionId) {
+      const sessionStream = connection.sessionStreams.get(sessionId);
+      if (!sessionStream) {
+        return textResponse("Unknown Acp-Session-Id", 404);
+      }
+
+      return sseResponse(sessionStream.subscribe());
     }
 
     return sseResponse(connection.connectionStream.subscribe());
@@ -176,18 +193,40 @@ export class AcpServer {
   private async forwardConnectedMessage(
     connection: ConnectionState,
     message: AnyMessage,
-  ): Promise<void> {
+    headers: Headers,
+  ): Promise<ForwardResult> {
     if (isRequestMessage(message)) {
+      const route = determineRoute(message, headers);
+
+      if (!route.ok) {
+        return route;
+      }
+
+      if (route.value !== "connection") {
+        connection.ensureSession(route.value.session);
+      }
+
       const key = messageIdKey(message.id);
 
       if (key) {
-        connection.pendingRoutes.set(key, determineRoute());
+        connection.pendingRoutes.set(key, route.value);
       }
     }
 
     await writeInbound(connection, message);
+    return { ok: true };
   }
 }
+
+type ForwardResult =
+  | {
+      ok: true;
+    }
+  | {
+      ok: false;
+      status: number;
+      message: string;
+    };
 
 type JsonResult =
   | {
@@ -196,6 +235,17 @@ type JsonResult =
     }
   | {
       ok: false;
+    };
+
+type RouteResult =
+  | {
+      ok: true;
+      value: ResponseRoute;
+    }
+  | {
+      ok: false;
+      status: number;
+      message: string;
     };
 
 async function readJson(req: Request): Promise<JsonResult> {
@@ -224,8 +274,43 @@ async function writeInbound(
   }
 }
 
-function determineRoute(): ResponseRoute {
-  return "connection";
+function determineRoute(
+  message: AnyMessage & {
+    readonly method: string;
+    readonly params?: unknown;
+  },
+  headers: Headers,
+): RouteResult {
+  const headerSessionId = headers.get(HEADER_SESSION_ID);
+
+  if (headerSessionId) {
+    return {
+      ok: true,
+      value: { session: headerSessionId },
+    };
+  }
+
+  const paramsSessionId = sessionIdFromParams(message.params);
+
+  if (paramsSessionId) {
+    return {
+      ok: true,
+      value: { session: paramsSessionId },
+    };
+  }
+
+  if (methodRequiresSessionHeader(message.method)) {
+    return {
+      ok: false,
+      status: 400,
+      message: "Missing Acp-Session-Id",
+    };
+  }
+
+  return {
+    ok: true,
+    value: "connection",
+  };
 }
 
 function isJsonRpcMessage(value: unknown): value is AnyMessage {
@@ -236,9 +321,11 @@ function isJsonRpcMessage(value: unknown): value is AnyMessage {
   );
 }
 
-function isRequestMessage(
-  message: AnyMessage,
-): message is AnyMessage & { readonly id: string | number | null } {
+function isRequestMessage(message: AnyMessage): message is AnyMessage & {
+  readonly id: string | number | null;
+  readonly method: string;
+  readonly params?: unknown;
+} {
   return "method" in message && "id" in message;
 }
 

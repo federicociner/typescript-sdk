@@ -1,5 +1,5 @@
 import { AgentSideConnection } from "./acp.js";
-import { messageIdKey } from "./protocol.js";
+import { messageIdKey, sessionIdFromParams } from "./protocol.js";
 
 import type { Agent } from "./acp.js";
 import type { AnyMessage, AnyResponse } from "./jsonrpc.js";
@@ -84,6 +84,7 @@ export class ConnectionState {
   readonly agentConnection: AgentSideConnection;
   readonly connectionStream = new OutboundStream();
   readonly allOutbound = new OutboundStream();
+  readonly sessionStreams = new Map<string, OutboundStream>();
   readonly pendingRoutes = new Map<string, ResponseRoute>();
 
   private hasStartedRouter = false;
@@ -135,9 +136,27 @@ export class ConnectionState {
     void this.runRouter();
   }
 
+  ensureSession(sessionId: string): OutboundStream {
+    const existing = this.sessionStreams.get(sessionId);
+    if (existing) {
+      return existing;
+    }
+
+    const stream = new OutboundStream();
+    this.sessionStreams.set(sessionId, stream);
+
+    return stream;
+  }
+
   async shutdown(): Promise<void> {
     this.connectionStream.close();
     this.allOutbound.close();
+
+    for (const stream of this.sessionStreams.values()) {
+      stream.close();
+    }
+
+    this.sessionStreams.clear();
     this.pendingRoutes.clear();
 
     await Promise.allSettled([
@@ -170,6 +189,10 @@ export class ConnectionState {
       reader.releaseLock();
       this.connectionStream.close();
       this.allOutbound.close();
+
+      for (const stream of this.sessionStreams.values()) {
+        stream.close();
+      }
     }
   }
 
@@ -179,6 +202,13 @@ export class ConnectionState {
     if (isResponse(message)) {
       const key = messageIdKey(message.id);
       const route = key ? this.pendingRoutes.get(key) : undefined;
+      const sessionId = sessionIdFromResult(
+        "result" in message ? message.result : undefined,
+      );
+
+      if (sessionId) {
+        this.ensureSession(sessionId);
+      }
 
       if (key) {
         this.pendingRoutes.delete(key);
@@ -186,6 +216,14 @@ export class ConnectionState {
 
       this.pushToRoute(route ?? "connection", message);
       return;
+    }
+
+    if ("method" in message) {
+      const sessionId = sessionIdFromParams(message.params);
+      if (sessionId) {
+        this.ensureSession(sessionId).push(message);
+        return;
+      }
     }
 
     this.connectionStream.push(message);
@@ -197,7 +235,7 @@ export class ConnectionState {
       return;
     }
 
-    this.connectionStream.push(message);
+    this.ensureSession(route.session).push(message);
   }
 }
 
@@ -332,4 +370,17 @@ function isMatchingResponse(
 
 function isResponse(msg: AnyMessage): msg is AnyResponse {
   return "id" in msg && !("method" in msg);
+}
+
+function sessionIdFromResult(result: unknown): string | undefined {
+  if (!isRecord(result)) {
+    return undefined;
+  }
+
+  const sessionId = result["sessionId"];
+  return typeof sessionId === "string" ? sessionId : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

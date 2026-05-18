@@ -30,6 +30,18 @@ const sessionNewRequest = {
   },
 } as const;
 
+function createPromptRequest(id: number, sessionId: string) {
+  return {
+    jsonrpc: "2.0",
+    id,
+    method: "session/prompt",
+    params: {
+      sessionId,
+      prompt: [{ type: "text", text: "Hello" }],
+    },
+  } as const;
+}
+
 const messageOne = { jsonrpc: "2.0", id: 1, result: "one" } as const;
 const messageTwo = { jsonrpc: "2.0", id: 2, result: "two" } as const;
 const messageThree = { jsonrpc: "2.0", id: 3, result: "three" } as const;
@@ -144,6 +156,70 @@ describe("ConnectionRegistry", () => {
 
     registry.closeAll();
   });
+
+  it("returns the same session stream for repeated ensureSession calls", () => {
+    const registry = new ConnectionRegistry();
+    const connection = registry.createConnection(
+      (conn: AgentSideConnection) => new TestAgent(conn),
+    );
+    const sessionId = globalThis.crypto.randomUUID();
+
+    expect(connection.ensureSession(sessionId)).toBe(
+      connection.ensureSession(sessionId),
+    );
+    expect(connection.sessionStreams.get(sessionId)).toBe(
+      connection.ensureSession(sessionId),
+    );
+
+    registry.closeAll();
+  });
+
+  it("routes session responses and notifications to the session stream", async () => {
+    const registry = new ConnectionRegistry();
+    const connection = registry.createConnection(
+      (conn: AgentSideConnection) => new TestAgent(conn, { chunkCount: 1 }),
+    );
+    const sessionId = globalThis.crypto.randomUUID();
+    const promptRequest = createPromptRequest(3, sessionId);
+
+    await initializeConnection(connection);
+
+    const sessionSubscription = connection.ensureSession(sessionId).subscribe();
+    const connectionSubscription = connection.connectionStream.subscribe();
+    const key = messageIdKey(promptRequest.id);
+
+    expect(key).toBe("number:3");
+    connection.pendingRoutes.set(key ?? "", { session: sessionId });
+
+    await writeInbound(connection.inboundTx, promptRequest);
+
+    expect(await readNext(sessionSubscription.stream)).toMatchObject({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            text: "chunk-1",
+          },
+        },
+      },
+    });
+    expect(await readNext(sessionSubscription.stream)).toMatchObject({
+      jsonrpc: "2.0",
+      id: promptRequest.id,
+      result: {
+        stopReason: "end_turn",
+      },
+    });
+    expect(connection.pendingRoutes.has(key ?? "")).toBe(false);
+    expect(
+      await readNextOrUndefined(connectionSubscription.stream),
+    ).toBeUndefined();
+
+    registry.closeAll();
+  });
 });
 
 describe("OutboundStream", () => {
@@ -249,6 +325,27 @@ async function readNext(
   } finally {
     reader.releaseLock();
   }
+}
+
+async function readNextOrUndefined(
+  stream: ReadableStream<AnyMessage>,
+): Promise<AnyMessage | undefined> {
+  const reader = stream.getReader();
+
+  try {
+    return await Promise.race([
+      reader.read().then((result) => (result.done ? undefined : result.value)),
+      delay(50).then(() => undefined),
+    ]);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 const routeShapeCheck = "connection" satisfies ResponseRoute;
