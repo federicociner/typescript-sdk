@@ -24,6 +24,21 @@
   "type": "module",
   "main": "dist/acp.js",
   "types": "dist/acp.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/acp.d.ts",
+      "default": "./dist/acp.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./node": {
+      "types": "./dist/node-adapter.d.ts",
+      "default": "./dist/node-adapter.js"
+    },
+    "./schema/schema.json": "./schema/schema.json"
+  },
   "directories": {
     "example": "examples"
   },
