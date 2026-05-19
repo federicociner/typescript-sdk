@@ -1,3 +1,4 @@
+/** Minimal browser/Node-compatible WebSocket shape used by ACP transports. */
 export interface WebSocketLike {
   readonly readyState?: number;
   send(data: string): void;

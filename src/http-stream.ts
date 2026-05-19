@@ -14,15 +14,17 @@ import type { AnyMessage } from "./jsonrpc.js";
 import type { Stream } from "./stream.js";
 
 export interface HttpStreamOptions {
+  /** Fetch implementation to use. Defaults to `globalThis.fetch`. */
   readonly fetch?: typeof globalThis.fetch;
+  /** Headers to include on every HTTP/SSE request. */
   readonly headers?: Record<string, string>;
 }
 
 /**
- * Creates an ACP Stream that speaks the Streamable HTTP transport.
+ * Creates an ACP Stream over Streamable HTTP.
  *
- * The transport uses HTTP POST for client-to-agent messages and SSE GET streams for agent-to-client messages.
- * Cookie management is intentionally not built in; pass a cookie-aware fetch implementation when needed.
+ * Uses POST for client messages and SSE GET streams for server messages.
+ * Pass a custom `fetch` for cookies, auth, proxies, or non-browser runtimes.
  */
 export function createHttpStream(
   serverUrl: string,

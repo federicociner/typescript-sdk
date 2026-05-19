@@ -18,6 +18,7 @@ import type {
 import type { AnyMessage, AnyRequest } from "./jsonrpc.js";
 import type { WebSocketLike } from "./ws-utils.js";
 
+/** WebSocket shape accepted by `AcpServer.handleWebSocket`. */
 export type WebSocketServerSocket = WebSocketLike;
 
 type ForwardResult =

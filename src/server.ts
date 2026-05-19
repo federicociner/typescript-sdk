@@ -26,10 +26,19 @@ import type {
 import type { Agent, AgentSideConnection } from "./acp.js";
 import type { AnyMessage, AnyRequest, AnyResponse } from "./jsonrpc.js";
 
+/** Options for creating an ACP server transport. */
 export interface AcpServerOptions {
+  /** Creates the agent implementation for each accepted ACP connection. */
   createAgent: (conn: AgentSideConnection) => Agent;
 }
 
+/**
+ * ACP server transport for Streamable HTTP and WebSocket connections.
+ *
+ * Route HTTP requests to {@link handleRequest}. For WebSocket upgrades, let your
+ * framework perform the upgrade and pass the accepted socket to
+ * {@link handleWebSocket}.
+ */
 export class AcpServer {
   private readonly createAgent: (conn: AgentSideConnection) => Agent;
   private readonly registry = new ConnectionRegistry();
@@ -38,6 +47,7 @@ export class AcpServer {
     this.createAgent = options.createAgent;
   }
 
+  /** Handles one Streamable HTTP ACP request. */
   async handleRequest(req: Request): Promise<Response> {
     if (req.method === "POST") {
       return await this.handlePost(req);
@@ -54,6 +64,7 @@ export class AcpServer {
     return textResponse("Method Not Allowed", 405);
   }
 
+  /** Handles one accepted ACP WebSocket connection. */
   handleWebSocket(socket: WebSocketServerSocket): void {
     handleWebSocketConnection(socket, {
       registry: this.registry,
@@ -61,6 +72,7 @@ export class AcpServer {
     });
   }
 
+  /** Closes all active ACP connections owned by this server. */
   async close(): Promise<void> {
     this.registry.closeAll();
   }

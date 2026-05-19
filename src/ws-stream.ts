@@ -5,18 +5,18 @@ import type { AnyMessage } from "./jsonrpc.js";
 import type { Stream } from "./stream.js";
 
 export interface WebSocketStreamOptions {
-  /** WebSocket subprotocols. */
+  /** WebSocket subprotocols to request. */
   readonly protocols?: string[];
   /**
-   * Custom headers for runtimes/constructors that support them, such as Node.js
-   * `ws`. Browsers ignore custom headers because the browser WebSocket API does
-   * not expose a headers option.
+   * Headers for WebSocket constructors that support them, such as Node `ws`.
+   * Browser WebSocket constructors ignore custom headers.
    */
   readonly headers?: Record<string, string>;
-  /** Custom WebSocket constructor, for example `ws.WebSocket` in Node.js. */
+  /** WebSocket constructor to use. Defaults to `globalThis.WebSocket`. */
   readonly WebSocket?: WebSocketConstructor;
 }
 
+/** Constructor shape used by `createWebSocketStream`. */
 export interface WebSocketConstructor {
   new (
     url: string,
@@ -25,14 +25,15 @@ export interface WebSocketConstructor {
   ): WebSocketLike;
 }
 
+export type { WebSocketLike };
+
 const SOCKET_OPEN = 1;
 
 /**
- * Creates an ACP Stream that speaks JSON-RPC over WebSocket text frames.
+ * Creates an ACP Stream over WebSocket.
  *
- * Browser WebSocket constructors do not support custom headers. The `headers`
- * option is passed as a best-effort third constructor argument for runtimes such
- * as Node.js `ws` that accept it.
+ * Sends and receives ACP JSON-RPC messages as WebSocket text frames. In Node,
+ * pass a WebSocket constructor such as `ws.WebSocket` via `options.WebSocket`.
  */
 export function createWebSocketStream(
   serverUrl: string,
