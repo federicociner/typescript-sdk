@@ -176,7 +176,7 @@ describe("AcpServer", () => {
     }
   });
 
-  it("rejects session-scoped GETs for unknown sessions", async () => {
+  it("opens session-scoped GETs for sessions without local streams", async () => {
     const server = await startTestServer();
 
     try {
@@ -187,7 +187,7 @@ describe("AcpServer", () => {
         globalThis.crypto.randomUUID(),
       );
 
-      expect(response.status).toBe(404);
+      expect(response.status).toBe(200);
     } finally {
       await server.close();
     }

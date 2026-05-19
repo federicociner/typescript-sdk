@@ -5,11 +5,18 @@ import {
   HEADER_SESSION_ID,
   JSON_MIME_TYPE,
 } from "./protocol.js";
+import { PROTOCOL_VERSION } from "./schema/index.js";
 import { parseSseStream } from "./sse.js";
 import { TestAgent } from "./test-support/test-agent.js";
 import { startTestServer } from "./test-support/test-http-server.js";
 
-import type { AgentSideConnection } from "./acp.js";
+import type {
+  AgentSideConnection,
+  InitializeRequest,
+  InitializeResponse,
+  LoadSessionRequest,
+  LoadSessionResponse,
+} from "./acp.js";
 import type { AnyMessage } from "./jsonrpc.js";
 
 const initializeRequest = {
@@ -55,6 +62,49 @@ function createForkRequest(id: number, sessionId: string) {
       sessionId,
     },
   };
+}
+
+function createLoadSessionRequest(id: number, sessionId: string) {
+  return {
+    jsonrpc: "2.0",
+    id,
+    method: "session/load",
+    params: {
+      cwd: "/tmp",
+      mcpServers: [],
+      sessionId,
+    },
+  };
+}
+
+class LoadSessionAgent extends TestAgent {
+  constructor(private readonly agentConnection: AgentSideConnection) {
+    super(agentConnection);
+  }
+
+  initialize(_params: InitializeRequest): Promise<InitializeResponse> {
+    return Promise.resolve({
+      protocolVersion: PROTOCOL_VERSION,
+      agentCapabilities: {
+        loadSession: true,
+      },
+    });
+  }
+
+  async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    await this.agentConnection.sessionUpdate({
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: "replayed-session-history",
+        },
+      },
+    });
+
+    return {};
+  }
 }
 
 describe("AcpServer session SSE", () => {
@@ -198,6 +248,58 @@ describe("AcpServer session SSE", () => {
       );
 
       expect(response.status).toBe(202);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("routes session/load replay updates to session SSE and final response to connection SSE", async () => {
+    const server = await startTestServer(
+      (conn: AgentSideConnection) => new LoadSessionAgent(conn),
+    );
+
+    try {
+      const connectionId = await initialize(server.url);
+      const sessionId = "existing-session";
+      const connectionSse = await openConnectionSse(server.url, connectionId);
+      const sessionSse = await openSessionSse(
+        server.url,
+        connectionId,
+        sessionId,
+      );
+      const accepted = await postJson(
+        server.url,
+        createLoadSessionRequest(3, sessionId),
+        {
+          [HEADER_CONNECTION_ID]: connectionId,
+          [HEADER_SESSION_ID]: sessionId,
+        },
+      );
+
+      expect(sessionSse.status).toBe(200);
+      expect(accepted.status).toBe(202);
+      expect(await readSseMessages(sessionSse, 1)).toMatchObject([
+        {
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: {
+                text: "replayed-session-history",
+              },
+            },
+          },
+        },
+      ]);
+      expect(await readSseMessages(connectionSse, 1)).toMatchObject([
+        {
+          jsonrpc: "2.0",
+          id: 3,
+          result: {},
+        },
+      ]);
     } finally {
       await server.close();
     }

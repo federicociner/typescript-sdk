@@ -14,6 +14,7 @@ import {
   isRequestMessage,
   isResponseMessage,
 } from "./jsonrpc.js";
+import { AGENT_METHODS } from "./schema/index.js";
 import { serializeSseEvent, serializeSseKeepAlive } from "./sse.js";
 import { handleWebSocketConnection } from "./ws-server.js";
 import type { WebSocketServerSocket } from "./ws-server.js";
@@ -179,12 +180,7 @@ export class AcpServer {
 
     const sessionId = req.headers.get(HEADER_SESSION_ID);
     if (sessionId) {
-      const sessionStream = connection.sessionStreams.get(sessionId);
-      if (!sessionStream) {
-        return textResponse("Unknown Acp-Session-Id", 404);
-      }
-
-      return sseResponse(sessionStream.subscribe());
+      return sseResponse(connection.ensureSession(sessionId).subscribe());
     }
 
     return sseResponse(connection.connectionStream.subscribe());
@@ -336,7 +332,10 @@ async function forwardClientRequest(
   const key = messageIdKey(message.id);
 
   if (key) {
-    connection.pendingRoutes.set(key, route.value);
+    connection.pendingRoutes.set(
+      key,
+      pendingResponseRoute(message, route.value),
+    );
   }
 
   await writeInbound(connection, message);
@@ -357,6 +356,13 @@ async function forwardClientNotification(
 ): Promise<ForwardResult> {
   await writeInbound(connection, message);
   return { ok: true };
+}
+
+function pendingResponseRoute(
+  message: ClientRequestMessage,
+  route: ResponseRoute,
+): ResponseRoute {
+  return message.method === AGENT_METHODS.session_load ? "connection" : route;
 }
 
 function determineRoute(
