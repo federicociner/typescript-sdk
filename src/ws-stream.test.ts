@@ -112,6 +112,49 @@ describe("createWebSocketStream", () => {
     }
   });
 
+  it("ignores binary WebSocket initialize frames", async () => {
+    const server = await startTestServer();
+    const socket = new WebSocket(server.wsUrl);
+    const upgrade = new Promise<IncomingMessage>((resolve, reject) => {
+      socket.once("upgrade", resolve);
+      socket.once("error", reject);
+    });
+    const close = new Promise<{ code: number; reason: string }>((resolve) => {
+      socket.once("close", (code: number, reason: Buffer) => {
+        resolve({ code, reason: reason.toString("utf8") });
+      });
+    });
+
+    try {
+      const request = await upgrade;
+      const connectionId = request.headers[HEADER_CONNECTION_ID.toLowerCase()];
+      expect(connectionId).toMatch(/^[0-9a-f-]{36}$/);
+
+      socket.send(Buffer.from(JSON.stringify(initializeRequest)), {
+        binary: true,
+      });
+      socket.send(JSON.stringify(sessionNewRequest));
+
+      await expect(close).resolves.toEqual({
+        code: 1002,
+        reason: "First message must be initialize",
+      });
+
+      const response = await fetch(server.url, {
+        method: "GET",
+        headers: {
+          Accept: "text/event-stream",
+          [HEADER_CONNECTION_ID]: String(connectionId),
+        },
+      });
+
+      expect(response.status).toBe(404);
+    } finally {
+      socket.close();
+      await server.close();
+    }
+  });
+
   it("uses the custom WebSocket constructor and queues writes until the socket opens", async () => {
     const instances: FakeWebSocket[] = [];
     const stream = createWebSocketStream("ws://agent.example/acp", {
@@ -158,6 +201,12 @@ describe("createWebSocketStream", () => {
       const socket = fakeSocketAt(instances, 0);
       socket.open();
       socket.receive(new Uint8Array([1, 2, 3]), true);
+      socket.receive(
+        new TextEncoder().encode(JSON.stringify(initializeResponse)),
+      );
+      socket.receive(
+        new TextEncoder().encode(JSON.stringify(initializeResponse)).buffer,
+      );
       socket.receive("not json");
       socket.receive(JSON.stringify({ hello: "world" }));
       socket.receive(JSON.stringify(initializeResponse));
