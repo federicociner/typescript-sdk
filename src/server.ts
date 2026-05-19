@@ -9,11 +9,7 @@ import {
   methodRequiresSessionHeader,
   sessionIdFromParams,
 } from "./protocol.js";
-import {
-  isJsonRpcMessage,
-  isRequestMessage,
-  isResponseMessage,
-} from "./jsonrpc.js";
+import { isJsonRpcMessage, isResponseMessage } from "./jsonrpc.js";
 import { AGENT_METHODS } from "./schema/index.js";
 import { serializeSseEvent, serializeSseKeepAlive } from "./sse.js";
 import { handleWebSocketConnection } from "./ws-server.js";
@@ -25,7 +21,12 @@ import type {
   ResponseRoute,
 } from "./connection.js";
 import type { Agent, AgentSideConnection } from "./acp.js";
-import type { AnyMessage, AnyRequest, AnyResponse } from "./jsonrpc.js";
+import type {
+  AnyMessage,
+  AnyNotification,
+  AnyRequest,
+  AnyResponse,
+} from "./jsonrpc.js";
 
 /** Options for creating an ACP server transport. */
 export interface AcpServerOptions {
@@ -129,8 +130,12 @@ export class AcpServer {
 
     const connectionId = req.headers.get(HEADER_CONNECTION_ID);
 
-    if (isInitializeRequest(body.value) && !connectionId) {
-      return await this.handleInitialize(body.value);
+    if (isInitializeRequest(body.value)) {
+      if (!connectionId) {
+        return await this.handleInitialize(body.value);
+      }
+
+      return textResponse("Initialize not allowed on existing connection", 400);
     }
 
     if (!connectionId) {
@@ -180,7 +185,12 @@ export class AcpServer {
 
     const sessionId = req.headers.get(HEADER_SESSION_ID);
     if (sessionId) {
-      return sseResponse(connection.ensureSession(sessionId).subscribe());
+      const sessionStream = connection.sessionStreams.get(sessionId);
+      if (!sessionStream) {
+        return textResponse("Unknown Acp-Session-Id", 404);
+      }
+
+      return sseResponse(sessionStream.subscribe());
     }
 
     return sseResponse(connection.connectionStream.subscribe());
@@ -244,15 +254,11 @@ export class AcpServer {
     message: AnyMessage,
     headers: Headers,
   ): Promise<ForwardResult> {
-    if (isRequestMessage(message)) {
-      return await forwardClientRequest(connection, message, headers);
-    }
-
     if (isResponseMessage(message)) {
       return await forwardClientResponse(connection, message);
     }
 
-    return await forwardClientNotification(connection, message);
+    return await forwardClientMethodMessage(connection, message, headers);
   }
 }
 
@@ -286,7 +292,7 @@ type RouteResult =
       message: string;
     };
 
-type ClientRequestMessage = AnyRequest;
+type ClientMethodMessage = AnyRequest | AnyNotification;
 
 async function readJson(req: Request): Promise<JsonResult> {
   try {
@@ -314,9 +320,9 @@ async function writeInbound(
   }
 }
 
-async function forwardClientRequest(
+async function forwardClientMethodMessage(
   connection: ConnectionState,
-  message: ClientRequestMessage,
+  message: ClientMethodMessage,
   headers: Headers,
 ): Promise<ForwardResult> {
   const route = determineRoute(message, headers);
@@ -329,7 +335,7 @@ async function forwardClientRequest(
     connection.ensureSession(route.value.session);
   }
 
-  const key = messageIdKey(message.id);
+  const key = "id" in message ? messageIdKey(message.id) : undefined;
 
   if (key) {
     connection.pendingRoutes.set(
@@ -350,23 +356,15 @@ async function forwardClientResponse(
   return { ok: true };
 }
 
-async function forwardClientNotification(
-  connection: ConnectionState,
-  message: AnyMessage,
-): Promise<ForwardResult> {
-  await writeInbound(connection, message);
-  return { ok: true };
-}
-
 function pendingResponseRoute(
-  message: ClientRequestMessage,
+  message: ClientMethodMessage,
   route: ResponseRoute,
 ): ResponseRoute {
   return message.method === AGENT_METHODS.session_load ? "connection" : route;
 }
 
 function determineRoute(
-  message: ClientRequestMessage,
+  message: ClientMethodMessage,
   headers: Headers,
 ): RouteResult {
   const headerSessionId = headers.get(HEADER_SESSION_ID);

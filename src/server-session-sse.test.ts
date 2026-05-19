@@ -77,6 +77,16 @@ function createLoadSessionRequest(id: number, sessionId: string) {
   };
 }
 
+function createCancelNotification(sessionId: string) {
+  return {
+    jsonrpc: "2.0",
+    method: "session/cancel",
+    params: {
+      sessionId,
+    },
+  };
+}
+
 class LoadSessionAgent extends TestAgent {
   constructor(private readonly agentConnection: AgentSideConnection) {
     super(agentConnection);
@@ -218,6 +228,47 @@ describe("AcpServer session SSE", () => {
     }
   });
 
+  it("rejects session-scoped notifications without a session header", async () => {
+    const server = await startTestServer();
+
+    try {
+      const connectionId = await initialize(server.url);
+      const sessionId = await createSession(server.url, connectionId);
+      const response = await postJson(
+        server.url,
+        createCancelNotification(sessionId),
+        {
+          [HEADER_CONNECTION_ID]: connectionId,
+        },
+      );
+
+      expect(response.status).toBe(400);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects session-scoped notifications with mismatched session header and params", async () => {
+    const server = await startTestServer();
+
+    try {
+      const connectionId = await initialize(server.url);
+      const sessionId = await createSession(server.url, connectionId);
+      const response = await postJson(
+        server.url,
+        createCancelNotification("other-session"),
+        {
+          [HEADER_CONNECTION_ID]: connectionId,
+          [HEADER_SESSION_ID]: sessionId,
+        },
+      );
+
+      expect(response.status).toBe(400);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("rejects session-scoped requests without any session identifier", async () => {
     const server = await startTestServer();
 
@@ -262,11 +313,6 @@ describe("AcpServer session SSE", () => {
       const connectionId = await initialize(server.url);
       const sessionId = "existing-session";
       const connectionSse = await openConnectionSse(server.url, connectionId);
-      const sessionSse = await openSessionSse(
-        server.url,
-        connectionId,
-        sessionId,
-      );
       const accepted = await postJson(
         server.url,
         createLoadSessionRequest(3, sessionId),
@@ -275,9 +321,14 @@ describe("AcpServer session SSE", () => {
           [HEADER_SESSION_ID]: sessionId,
         },
       );
+      const sessionSse = await openSessionSse(
+        server.url,
+        connectionId,
+        sessionId,
+      );
 
-      expect(sessionSse.status).toBe(200);
       expect(accepted.status).toBe(202);
+      expect(sessionSse.status).toBe(200);
       expect(await readSseMessages(sessionSse, 1)).toMatchObject([
         {
           jsonrpc: "2.0",

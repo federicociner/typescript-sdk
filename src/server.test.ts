@@ -176,7 +176,7 @@ describe("AcpServer", () => {
     }
   });
 
-  it("opens session-scoped GETs for sessions without local streams", async () => {
+  it("rejects session-scoped GETs for unknown sessions", async () => {
     const server = await startTestServer();
 
     try {
@@ -187,7 +187,7 @@ describe("AcpServer", () => {
         globalThis.crypto.randomUUID(),
       );
 
-      expect(response.status).toBe(200);
+      expect(response.status).toBe(404);
     } finally {
       await server.close();
     }
@@ -378,6 +378,21 @@ describe("AcpServer", () => {
 
     try {
       const response = await postJson(server.url, sessionNewRequest);
+
+      expect(response.status).toBe(400);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects initialize requests on existing connections", async () => {
+    const server = await startTestServer();
+
+    try {
+      const connectionId = await initialize(server.url);
+      const response = await postJson(server.url, initializeRequest, {
+        [HEADER_CONNECTION_ID]: connectionId,
+      });
 
       expect(response.status).toBe(400);
     } finally {
