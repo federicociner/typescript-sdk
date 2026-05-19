@@ -255,7 +255,7 @@ export class AcpServer {
     headers: Headers,
   ): Promise<ForwardResult> {
     if (isResponseMessage(message)) {
-      return await forwardClientResponse(connection, message);
+      return await forwardClientResponse(connection, message, headers);
     }
 
     return await forwardClientMethodMessage(connection, message, headers);
@@ -351,7 +351,32 @@ async function forwardClientMethodMessage(
 async function forwardClientResponse(
   connection: ConnectionState,
   message: AnyResponse,
+  headers: Headers,
 ): Promise<ForwardResult> {
+  const key = messageIdKey(message.id);
+  const route = key ? connection.clientResponseRoutes.get(key) : undefined;
+  const headerSessionId = headers.get(HEADER_SESSION_ID);
+
+  if (route && route !== "connection" && !headerSessionId) {
+    return {
+      ok: false,
+      status: 400,
+      message: "Missing Acp-Session-Id",
+    };
+  }
+
+  if (route && route !== "connection" && headerSessionId !== route.session) {
+    return {
+      ok: false,
+      status: 400,
+      message: "Mismatched Acp-Session-Id",
+    };
+  }
+
+  if (key) {
+    connection.clientResponseRoutes.delete(key);
+  }
+
   await writeInbound(connection, message);
   return { ok: true };
 }

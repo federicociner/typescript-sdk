@@ -91,6 +91,7 @@ export class ConnectionState {
   readonly allOutbound = new OutboundStream();
   readonly sessionStreams = new Map<string, OutboundStream>();
   readonly pendingRoutes = new Map<string, ResponseRoute>();
+  readonly clientResponseRoutes = new Map<string, ResponseRoute>();
 
   private hasStartedRouter = false;
   private outboundReader: ReadableStreamDefaultReader<AnyMessage> | undefined;
@@ -163,6 +164,7 @@ export class ConnectionState {
 
     this.sessionStreams.clear();
     this.pendingRoutes.clear();
+    this.clientResponseRoutes.clear();
 
     await Promise.allSettled([
       this.inboundTx.close(),
@@ -231,11 +233,27 @@ export class ConnectionState {
   private routeOutboundRequestOrNotification(message: AnyMessage): void {
     const sessionId = sessionIdFromMessageParams(message);
     if (sessionId) {
+      this.trackClientResponseRoute(message, { session: sessionId });
       this.ensureSession(sessionId).push(message);
       return;
     }
 
+    this.trackClientResponseRoute(message, "connection");
     this.connectionStream.push(message);
+  }
+
+  private trackClientResponseRoute(
+    message: AnyMessage,
+    route: ResponseRoute,
+  ): void {
+    if (!("id" in message) || !("method" in message)) {
+      return;
+    }
+
+    const key = messageIdKey(message.id);
+    if (key) {
+      this.clientResponseRoutes.set(key, route);
+    }
   }
 
   private pushToRoute(route: ResponseRoute, message: AnyMessage): void {

@@ -45,6 +45,64 @@ function createPromptRequest(id: number, sessionId: string) {
 }
 
 describe("AcpServer permission requests over HTTP", () => {
+  it("rejects session-scoped client responses without a session header", async () => {
+    const server = await startTestServer(
+      (conn: AgentSideConnection) =>
+        new TestAgent(conn, { enablePermission: true }),
+    );
+
+    try {
+      const connectionId = await initialize(server.url);
+      const sessionId = await createSession(server.url, connectionId);
+      const sessionSse = await openSessionSse(
+        server.url,
+        connectionId,
+        sessionId,
+      );
+      const sessionEvents = createSseMessageIterator(sessionSse);
+
+      expect(
+        await postJson(server.url, createPromptRequest(3, sessionId), {
+          [HEADER_CONNECTION_ID]: connectionId,
+          [HEADER_SESSION_ID]: sessionId,
+        }),
+      ).toMatchObject({ status: 202 });
+
+      await readNextSseMessage(sessionEvents);
+      const permissionRequest = await readNextSseMessage(sessionEvents);
+
+      const permissionResponse = {
+        jsonrpc: "2.0",
+        id: readMessageId(permissionRequest),
+        result: {
+          outcome: {
+            outcome: "selected",
+            optionId: "allow",
+          },
+        },
+      };
+
+      expect(
+        await postJson(server.url, permissionResponse, {
+          [HEADER_CONNECTION_ID]: connectionId,
+        }),
+      ).toMatchObject({ status: 400 });
+      expect(
+        await postJson(server.url, permissionResponse, {
+          [HEADER_CONNECTION_ID]: connectionId,
+          [HEADER_SESSION_ID]: sessionId,
+        }),
+      ).toMatchObject({ status: 202 });
+
+      await readNextSseMessage(sessionEvents);
+      await readNextSseMessage(sessionEvents);
+      await sessionEvents.return?.();
+      await sessionSse.body?.cancel();
+    } finally {
+      await server.close();
+    }
+  }, 10_000);
+
   it("routes permission requests over session SSE and accepts client responses", async () => {
     const server = await startTestServer(
       (conn: AgentSideConnection) =>
@@ -122,7 +180,10 @@ describe("AcpServer permission requests over HTTP", () => {
               },
             },
           },
-          { [HEADER_CONNECTION_ID]: connectionId },
+          {
+            [HEADER_CONNECTION_ID]: connectionId,
+            [HEADER_SESSION_ID]: sessionId,
+          },
         ),
       ).toMatchObject({ status: 202 });
 

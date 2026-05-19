@@ -5,6 +5,7 @@ import {
   HEADER_SESSION_ID,
   JSON_MIME_TYPE,
   isInitializeRequest,
+  messageIdKey,
   sessionIdFromMessageParams,
   sessionIdFromResponseResult,
 } from "./protocol.js";
@@ -44,6 +45,7 @@ class HttpStreamTransport {
   private readonly cookieJar = new ConnectionCookieJar();
   private readonly abortController = new AbortController();
   private readonly knownSessions = new Set<string>();
+  private readonly pendingResponseSessions = new Map<string, string>();
 
   private readableController:
     | ReadableStreamDefaultController<AnyMessage>
@@ -133,7 +135,11 @@ class HttpStreamTransport {
       throw new Error("ACP HTTP stream is not initialized");
     }
 
-    const sessionId = sessionIdFromMessageParams(message);
+    const sessionId = this.sessionIdForOutboundMessage(message);
+    if (sessionId) {
+      this.openSessionSse(sessionId);
+    }
+
     const response = await this.fetchRequest({
       method: "POST",
       headers: {
@@ -147,6 +153,20 @@ class HttpStreamTransport {
     if (!response.ok) {
       throw await httpError("ACP POST failed", response);
     }
+  }
+
+  private sessionIdForOutboundMessage(message: AnyMessage): string | undefined {
+    const paramsSessionId = sessionIdFromMessageParams(message);
+    if (paramsSessionId) {
+      return paramsSessionId;
+    }
+
+    if (!("id" in message) || "method" in message) {
+      return undefined;
+    }
+
+    const key = messageIdKey(message.id);
+    return key ? this.pendingResponseSessions.get(key) : undefined;
   }
 
   private openConnectionSse(): void {
@@ -207,6 +227,7 @@ class HttpStreamTransport {
           this.openSessionSse(sessionId);
         }
 
+        this.trackServerRequestRoute(message, headers[HEADER_SESSION_ID]);
         this.enqueue(message);
       }
     } catch (error) {
@@ -215,6 +236,20 @@ class HttpStreamTransport {
       }
 
       this.errorReadable(error);
+    }
+  }
+
+  private trackServerRequestRoute(
+    message: AnyMessage,
+    streamSessionId: string | undefined,
+  ): void {
+    if (!streamSessionId || !("method" in message) || !("id" in message)) {
+      return;
+    }
+
+    const key = messageIdKey(message.id);
+    if (key) {
+      this.pendingResponseSessions.set(key, streamSessionId);
     }
   }
 
