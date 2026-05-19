@@ -99,4 +99,10 @@ Or run the WebSocket client:
 npx tsx src/examples/ws-client.ts
 ```
 
-The HTTP example sends a bearer token through custom request headers. The WebSocket example passes the Node `ws` constructor so custom headers can be sent during the WebSocket handshake. Browser WebSocket clients can use `createWebSocketStream` too, but browsers do not allow custom WebSocket headers.
+The HTTP example sends a bearer token through custom request headers. `createHttpStream` includes cookies by default for the lifetime of one stream: it sends credentials on fetch requests, captures exposed `Set-Cookie` headers, merges them with caller-provided `Cookie` headers, and reuses them for connection SSE, session SSE, POST, and DELETE requests. Pass `cookies: "omit"` to disable this behavior for stateless transports.
+
+The WebSocket server example uses `createNodeWebSocketUpgradeHandler`, which creates the ACP connection before the upgrade completes and adds `Acp-Connection-Id` to the `101 Switching Protocols` response. Frameworks that only expose an already-upgraded WebSocket socket cannot add that response header, so prefer an upgrade hook when building compliant servers.
+
+The WebSocket client example passes the Node `ws` constructor so custom headers can be sent during the WebSocket handshake. Browser WebSocket clients can use `createWebSocketStream` too, but browsers do not allow custom WebSocket headers. Use cookies or URL-level authentication for browser WebSocket authentication instead of relying on custom handshake headers.
+
+The included Node HTTP server is an HTTP/1.1 compatibility adapter. HTTP/2 deployment guidance is still tracked separately in the transport hardening plan.

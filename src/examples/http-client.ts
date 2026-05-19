@@ -34,8 +34,7 @@ const stream = createHttpStream(serverUrl, {
   headers: {
     Authorization: "Bearer example-token",
   },
-  // To use cookies, pass a cookie-aware fetch implementation here instead of relying on a built-in cookie jar.
-  // fetch: cookieAwareFetch,
+  // Cookies are included by default and scoped to this stream. Use `cookies: "omit"` for stateless requests.
 });
 const connection = new acp.ClientSideConnection(
   (_agent) => new HttpExampleClient(),

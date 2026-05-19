@@ -71,6 +71,7 @@ const acpServer = new AcpServer({
 });
 const acpHttpHandler = createNodeHttpHandler(acpServer);
 const webSocketServer = new WebSocketServer({ noServer: true });
+// Use the ACP upgrade helper so the 101 response includes Acp-Connection-Id.
 const acpWebSocketUpgradeHandler = createNodeWebSocketUpgradeHandler(
   acpServer,
   webSocketServer,
