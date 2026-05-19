@@ -275,15 +275,47 @@ describe("AcpServer", () => {
     }
   });
 
-  it("rejects POST without application/json Content-Type", async () => {
+  it("accepts POST with application/json Content-Type parameters", async () => {
     const server = await startTestServer();
 
     try {
       const response = await fetch(server.url, {
         method: "POST",
         headers: {
-          "Content-Type": "text/plain",
+          "Content-Type": "application/json; charset=utf-8",
         },
+        body: JSON.stringify(initializeRequest),
+      });
+
+      expect(response.status).toBe(200);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects POST without Content-Type", async () => {
+    const server = await startTestServer();
+
+    try {
+      const response = await fetch(server.url, { method: "POST" });
+
+      expect(response.status).toBe(415);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it.each([
+    "text/plain",
+    "application/jsonfoobar",
+    "application/json-patch+json",
+  ])("rejects POST with %s Content-Type", async (contentType) => {
+    const server = await startTestServer();
+
+    try {
+      const response = await fetch(server.url, {
+        method: "POST",
+        headers: { "Content-Type": contentType },
         body: JSON.stringify(initializeRequest),
       });
 

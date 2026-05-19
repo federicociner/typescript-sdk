@@ -44,6 +44,19 @@ function createPromptRequest(id: number, sessionId?: string) {
   };
 }
 
+function createForkRequest(id: number, sessionId: string) {
+  return {
+    jsonrpc: "2.0",
+    id,
+    method: "session/fork",
+    params: {
+      cwd: "/tmp",
+      mcpServers: [],
+      sessionId,
+    },
+  };
+}
+
 describe("AcpServer session SSE", () => {
   it("streams prompt updates and responses on the session SSE stream", async () => {
     const server = await startTestServer(
@@ -114,18 +127,13 @@ describe("AcpServer session SSE", () => {
     }
   });
 
-  it("routes session prompts using params.sessionId when the session header is absent", async () => {
+  it("rejects session-scoped requests without a session header", async () => {
     const server = await startTestServer();
 
     try {
       const connectionId = await initialize(server.url);
       const sessionId = await createSession(server.url, connectionId);
-      const sessionSse = await openSessionSse(
-        server.url,
-        connectionId,
-        sessionId,
-      );
-      const accepted = await postJson(
+      const response = await postJson(
         server.url,
         createPromptRequest(3, sessionId),
         {
@@ -133,25 +141,34 @@ describe("AcpServer session SSE", () => {
         },
       );
 
-      expect(accepted.status).toBe(202);
-      expect(await readSseMessages(sessionSse, 2)).toMatchObject([
-        {
-          jsonrpc: "2.0",
-          method: "session/update",
-          params: { sessionId },
-        },
-        {
-          jsonrpc: "2.0",
-          id: 3,
-          result: { stopReason: "end_turn" },
-        },
-      ]);
+      expect(response.status).toBe(400);
     } finally {
       await server.close();
     }
   });
 
-  it("rejects session-scoped requests without a session identifier", async () => {
+  it("rejects session-scoped requests with mismatched session header and params", async () => {
+    const server = await startTestServer();
+
+    try {
+      const connectionId = await initialize(server.url);
+      const sessionId = await createSession(server.url, connectionId);
+      const response = await postJson(
+        server.url,
+        createPromptRequest(3, "other-session"),
+        {
+          [HEADER_CONNECTION_ID]: connectionId,
+          [HEADER_SESSION_ID]: sessionId,
+        },
+      );
+
+      expect(response.status).toBe(400);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects session-scoped requests without any session identifier", async () => {
     const server = await startTestServer();
 
     try {
@@ -161,6 +178,26 @@ describe("AcpServer session SSE", () => {
       });
 
       expect(response.status).toBe(400);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("routes non-required session methods using params.sessionId when the session header is absent", async () => {
+    const server = await startTestServer();
+
+    try {
+      const connectionId = await initialize(server.url);
+      const sessionId = await createSession(server.url, connectionId);
+      const response = await postJson(
+        server.url,
+        createForkRequest(3, sessionId),
+        {
+          [HEADER_CONNECTION_ID]: connectionId,
+        },
+      );
+
+      expect(response.status).toBe(202);
     } finally {
       await server.close();
     }

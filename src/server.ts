@@ -108,7 +108,7 @@ export class AcpServer {
   private async handlePost(req: Request): Promise<Response> {
     const contentType = req.headers.get("Content-Type");
 
-    if (!contentType?.startsWith(JSON_MIME_TYPE)) {
+    if (!isJsonContentType(contentType)) {
       return textResponse("Unsupported Media Type", 415);
     }
 
@@ -364,6 +364,27 @@ function determineRoute(
   headers: Headers,
 ): RouteResult {
   const headerSessionId = headers.get(HEADER_SESSION_ID);
+  const paramsSessionId = sessionIdFromParams(message.params);
+
+  if (methodRequiresSessionHeader(message.method) && !headerSessionId) {
+    return {
+      ok: false,
+      status: 400,
+      message: "Missing Acp-Session-Id",
+    };
+  }
+
+  if (
+    headerSessionId !== null &&
+    paramsSessionId !== undefined &&
+    headerSessionId !== paramsSessionId
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      message: "Mismatched Acp-Session-Id",
+    };
+  }
 
   if (headerSessionId) {
     return {
@@ -372,8 +393,6 @@ function determineRoute(
     };
   }
 
-  const paramsSessionId = sessionIdFromParams(message.params);
-
   if (paramsSessionId) {
     return {
       ok: true,
@@ -381,18 +400,14 @@ function determineRoute(
     };
   }
 
-  if (methodRequiresSessionHeader(message.method)) {
-    return {
-      ok: false,
-      status: 400,
-      message: "Missing Acp-Session-Id",
-    };
-  }
-
   return {
     ok: true,
     value: "connection",
   };
+}
+
+function isJsonContentType(contentType: string | null): boolean {
+  return contentType?.split(";", 1)[0]?.trim().toLowerCase() === JSON_MIME_TYPE;
 }
 
 function sseResponse(subscription: OutboundSubscription): Response {
