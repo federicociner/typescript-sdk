@@ -18,7 +18,7 @@ import type {
 import type { AnyMessage, AnyRequest } from "./jsonrpc.js";
 import type { WebSocketLike } from "./ws-utils.js";
 
-/** WebSocket shape accepted by `AcpServer.handleWebSocket`. */
+/** WebSocket shape accepted by prepared ACP WebSocket upgrades. */
 export type WebSocketServerSocket = WebSocketLike;
 
 type ForwardResult =
@@ -33,6 +33,7 @@ type ForwardResult =
 export interface WebSocketConnectionOptions {
   readonly registry: ConnectionRegistry;
   readonly createAgent: (conn: AgentSideConnection) => Agent;
+  readonly connection?: ConnectionState;
 }
 
 export function handleWebSocketConnection(
@@ -45,6 +46,7 @@ export function handleWebSocketConnection(
 
 class WebSocketServerSession {
   private connection: ConnectionState | undefined;
+  private preparedConnection: ConnectionState | undefined;
   private outboundReader: ReadableStreamDefaultReader<AnyMessage> | undefined;
   private inboundWriteChain: Promise<void> = Promise.resolve();
   private isClosed = false;
@@ -53,7 +55,9 @@ class WebSocketServerSession {
   constructor(
     private readonly socket: WebSocketLike,
     private readonly options: WebSocketConnectionOptions,
-  ) {}
+  ) {
+    this.preparedConnection = options.connection;
+  }
 
   start(): void {
     this.detachListeners.push(
@@ -135,26 +139,30 @@ class WebSocketServerSession {
       return;
     }
 
-    let connection: ConnectionState | undefined;
+    const connection =
+      this.preparedConnection ??
+      this.options.registry.createConnection(this.options.createAgent);
+    this.preparedConnection = connection;
 
     try {
-      connection = this.options.registry.createConnection(
-        this.options.createAgent,
-      );
-
       await writeInbound(connection, message);
 
       const initialResponse = await connection.recvInitial(message.id);
 
+      if (this.isClosed) {
+        this.options.registry.remove(connection.connectionId);
+        return;
+      }
+
+      this.preparedConnection = undefined;
       this.connection = connection;
       connection.startRouter();
 
       this.send(initialResponse);
       this.startOutboundPump(connection);
     } catch (error) {
-      if (connection) {
-        this.options.registry.remove(connection.connectionId);
-      }
+      this.preparedConnection = undefined;
+      this.options.registry.remove(connection.connectionId);
 
       this.send({
         jsonrpc: "2.0",
@@ -322,6 +330,11 @@ class WebSocketServerSession {
     if (this.connection) {
       this.options.registry.remove(this.connection.connectionId);
       this.connection = undefined;
+    }
+
+    if (this.preparedConnection) {
+      this.options.registry.remove(this.preparedConnection.connectionId);
+      this.preparedConnection = undefined;
     }
   }
 }

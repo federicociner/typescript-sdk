@@ -32,12 +32,18 @@ export interface AcpServerOptions {
   createAgent: (conn: AgentSideConnection) => Agent;
 }
 
+export interface PreparedWebSocketUpgrade {
+  readonly connectionId: string;
+  accept(socket: WebSocketServerSocket): void;
+  reject(): void;
+}
+
 /**
  * ACP server transport for Streamable HTTP and WebSocket connections.
  *
- * Route HTTP requests to {@link handleRequest}. For WebSocket upgrades, let your
- * framework perform the upgrade and pass the accepted socket to
- * {@link handleWebSocket}.
+ * Route HTTP requests to {@link handleRequest}. For WebSocket upgrades, use
+ * {@link prepareWebSocketUpgrade} so adapters can attach `Acp-Connection-Id` to
+ * the `101 Switching Protocols` response.
  */
 export class AcpServer {
   private readonly createAgent: (conn: AgentSideConnection) => Agent;
@@ -64,12 +70,34 @@ export class AcpServer {
     return textResponse("Method Not Allowed", 405);
   }
 
-  /** Handles one accepted ACP WebSocket connection. */
-  handleWebSocket(socket: WebSocketServerSocket): void {
-    handleWebSocketConnection(socket, {
-      registry: this.registry,
-      createAgent: this.createAgent,
-    });
+  /** Creates a WebSocket connection before accepting the HTTP upgrade. */
+  prepareWebSocketUpgrade(): PreparedWebSocketUpgrade {
+    const connection = this.registry.createConnection(this.createAgent);
+    let isSettled = false;
+
+    return {
+      connectionId: connection.connectionId,
+      accept: (socket) => {
+        if (isSettled) {
+          throw new Error("ACP WebSocket upgrade has already been settled");
+        }
+
+        isSettled = true;
+        handleWebSocketConnection(socket, {
+          registry: this.registry,
+          createAgent: this.createAgent,
+          connection,
+        });
+      },
+      reject: () => {
+        if (isSettled) {
+          return;
+        }
+
+        isSettled = true;
+        this.registry.remove(connection.connectionId);
+      },
+    };
   }
 
   /** Closes all active ACP connections owned by this server. */

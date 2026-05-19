@@ -5,7 +5,10 @@ import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 
 import * as acp from "@agentclientprotocol/sdk";
-import { createNodeHttpHandler } from "@agentclientprotocol/sdk/node";
+import {
+  createNodeHttpHandler,
+  createNodeWebSocketUpgradeHandler,
+} from "@agentclientprotocol/sdk/node";
 import { AcpServer } from "@agentclientprotocol/sdk/server";
 
 class HttpExampleAgent implements acp.Agent {
@@ -68,6 +71,10 @@ const acpServer = new AcpServer({
 });
 const acpHttpHandler = createNodeHttpHandler(acpServer);
 const webSocketServer = new WebSocketServer({ noServer: true });
+const acpWebSocketUpgradeHandler = createNodeWebSocketUpgradeHandler(
+  acpServer,
+  webSocketServer,
+);
 const port = Number.parseInt(process.env.PORT ?? "7331", 10);
 
 const httpServer = createServer((req, res) => {
@@ -94,9 +101,7 @@ httpServer.on("upgrade", (req, socket, head) => {
     return;
   }
 
-  webSocketServer.handleUpgrade(req, socket, head, (ws) => {
-    acpServer.handleWebSocket(ws);
-  });
+  acpWebSocketUpgradeHandler(req, socket, head);
 });
 
 httpServer.listen(port, () => {

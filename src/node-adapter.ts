@@ -1,11 +1,63 @@
+import { HEADER_CONNECTION_ID } from "./protocol.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Duplex } from "node:stream";
 import type { AcpServer } from "./server.js";
+import type { WebSocketServer } from "ws";
 
 export function createNodeHttpHandler(
   server: AcpServer,
 ): (req: IncomingMessage, res: ServerResponse) => void {
   return (req, res) => {
     void handleNodeRequest(server, req, res);
+  };
+}
+
+export function createNodeWebSocketUpgradeHandler(
+  server: AcpServer,
+  webSocketServer: WebSocketServer,
+): (req: IncomingMessage, socket: Duplex, head: Buffer) => void {
+  return (req, socket, head) => {
+    const upgrade = server.prepareWebSocketUpgrade();
+    let hasAccepted = false;
+
+    const cleanup = (): void => {
+      webSocketServer.off("headers", onHeaders);
+      socket.off("close", onUpgradeFailed);
+      socket.off("error", onUpgradeFailed);
+    };
+
+    const onHeaders = (headers: string[], request: IncomingMessage): void => {
+      if (request !== req) {
+        return;
+      }
+
+      headers.push(`${HEADER_CONNECTION_ID}: ${upgrade.connectionId}`);
+    };
+
+    const onUpgradeFailed = (): void => {
+      if (hasAccepted) {
+        return;
+      }
+
+      cleanup();
+      upgrade.reject();
+    };
+
+    webSocketServer.on("headers", onHeaders);
+    socket.once("close", onUpgradeFailed);
+    socket.once("error", onUpgradeFailed);
+
+    try {
+      webSocketServer.handleUpgrade(req, socket, head, (webSocket) => {
+        hasAccepted = true;
+        cleanup();
+        upgrade.accept(webSocket);
+      });
+    } catch (error) {
+      cleanup();
+      upgrade.reject();
+      throw error;
+    }
   };
 }
 

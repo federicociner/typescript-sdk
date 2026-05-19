@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 
 import { ClientSideConnection, PROTOCOL_VERSION } from "./acp.js";
+import { HEADER_CONNECTION_ID } from "./protocol.js";
 import { createWebSocketStream } from "./ws-stream.js";
 import { TestAgent } from "./test-support/test-agent.js";
 import { startTestServer } from "./test-support/test-http-server.js";
 
+import type { IncomingMessage } from "node:http";
 import type {
   AgentSideConnection,
   Client,
@@ -40,7 +42,76 @@ const initializeResponse = {
   },
 } satisfies AnyMessage;
 
+const sessionNewRequest = {
+  jsonrpc: "2.0",
+  id: 1,
+  method: "session/new",
+  params: {
+    cwd: "/tmp",
+    mcpServers: [],
+  },
+} satisfies AnyMessage;
+
 describe("createWebSocketStream", () => {
+  it("exposes the ACP connection ID during the WebSocket handshake", async () => {
+    const server = await startTestServer();
+    const socket = new WebSocket(server.wsUrl);
+    const upgrade = new Promise<IncomingMessage>((resolve, reject) => {
+      socket.once("upgrade", resolve);
+      socket.once("error", reject);
+    });
+
+    try {
+      const request = await upgrade;
+      expect(request.headers[HEADER_CONNECTION_ID.toLowerCase()]).toMatch(
+        /^[0-9a-f-]{36}$/,
+      );
+    } finally {
+      socket.close();
+      await server.close();
+    }
+  });
+
+  it("closes pre-created WebSocket connections when the first frame is not initialize", async () => {
+    const server = await startTestServer();
+    const socket = new WebSocket(server.wsUrl);
+    const upgrade = new Promise<IncomingMessage>((resolve, reject) => {
+      socket.once("upgrade", resolve);
+      socket.once("error", reject);
+    });
+    const close = new Promise<{ code: number; reason: string }>((resolve) => {
+      socket.once("close", (code: number, reason: Buffer) => {
+        resolve({ code, reason: reason.toString("utf8") });
+      });
+    });
+
+    try {
+      const request = await upgrade;
+      const connectionId = request.headers[HEADER_CONNECTION_ID.toLowerCase()];
+      expect(connectionId).toMatch(/^[0-9a-f-]{36}$/);
+
+      socket.send(JSON.stringify(sessionNewRequest));
+
+      await expect(close).resolves.toEqual({
+        code: 1002,
+        reason: "First message must be initialize",
+      });
+
+      const response = await fetch(server.url, {
+        method: "GET",
+        headers: {
+          Accept: "text/event-stream",
+          [HEADER_CONNECTION_ID]: String(connectionId),
+        },
+      });
+
+      expect(response.status).toBe(404);
+    } finally {
+      socket.close();
+      await server.close();
+    }
+  });
+
   it("uses the custom WebSocket constructor and queues writes until the socket opens", async () => {
     const instances: FakeWebSocket[] = [];
     const stream = createWebSocketStream("ws://agent.example/acp", {

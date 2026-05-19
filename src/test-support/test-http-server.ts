@@ -2,7 +2,10 @@ import http from "node:http";
 import { WebSocketServer } from "ws";
 
 import { AcpServer } from "../server.js";
-import { createNodeHttpHandler } from "../node-adapter.js";
+import {
+  createNodeHttpHandler,
+  createNodeWebSocketUpgradeHandler,
+} from "../node-adapter.js";
 import { TestAgent } from "./test-agent.js";
 
 import type { AddressInfo } from "node:net";
@@ -23,11 +26,10 @@ export async function startTestServer(
   const httpServer = http.createServer(createNodeHttpHandler(acpServer));
   const webSocketServer = new WebSocketServer({ noServer: true });
 
-  httpServer.on("upgrade", (req, socket, head) => {
-    webSocketServer.handleUpgrade(req, socket, head, (webSocket) => {
-      acpServer.handleWebSocket(webSocket);
-    });
-  });
+  httpServer.on(
+    "upgrade",
+    createNodeWebSocketUpgradeHandler(acpServer, webSocketServer),
+  );
 
   await listen(httpServer, options.port ?? 0);
 
