@@ -137,6 +137,82 @@ describe("createHttpStream", () => {
     }
   });
 
+  it("propagates cookies across initialize, SSE, session POST, and DELETE", async () => {
+    const controlledFetch = createControlledFetch({
+      initializeCookies: ["transport=alpha; Path=/"],
+      getCookies: ["route=bravo; Path=/"],
+    });
+    const stream = createHttpStream("https://agent.example/acp", {
+      fetch: controlledFetch.fetch,
+      headers: {
+        Cookie: "caller=custom; transport=caller",
+      },
+    });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await writer.write(initializeRequest);
+      await readMessage(reader);
+      await controlledFetch.sendSse(0, sessionNewResponse);
+      await readMessage(reader);
+      await writer.write(promptRequest);
+      await writer.close();
+
+      expect(requestAt(controlledFetch.requests, 0).credentials).toBe(
+        "include",
+      );
+      expect(requestAt(controlledFetch.requests, 0).headers.get("Cookie")).toBe(
+        "caller=custom; transport=caller",
+      );
+      expect(requestAt(controlledFetch.requests, 1).headers.get("Cookie")).toBe(
+        "transport=caller; caller=custom",
+      );
+      expect(requestAt(controlledFetch.requests, 2).headers.get("Cookie")).toBe(
+        "transport=caller; route=bravo; caller=custom",
+      );
+      expect(requestAt(controlledFetch.requests, 3).headers.get("Cookie")).toBe(
+        "transport=caller; route=bravo; caller=custom",
+      );
+      expect(requestAt(controlledFetch.requests, 4).headers.get("Cookie")).toBe(
+        "transport=caller; route=bravo; caller=custom",
+      );
+      expect(
+        controlledFetch.requests.map((request) => request.credentials),
+      ).toEqual(["include", "include", "include", "include", "include"]);
+    } finally {
+      reader.releaseLock();
+      writer.releaseLock();
+    }
+  });
+
+  it("omits managed cookies when cookie handling is disabled", async () => {
+    const controlledFetch = createControlledFetch({
+      initializeCookies: ["transport=alpha; Path=/"],
+    });
+    const stream = createHttpStream("https://agent.example/acp", {
+      fetch: controlledFetch.fetch,
+      cookies: "omit",
+    });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await writer.write(initializeRequest);
+      await readMessage(reader);
+
+      expect(requestAt(controlledFetch.requests, 0).credentials).toBe("omit");
+      expect(requestAt(controlledFetch.requests, 1).credentials).toBe("omit");
+      expect(
+        requestAt(controlledFetch.requests, 1).headers.get("Cookie"),
+      ).toBeNull();
+    } finally {
+      reader.releaseLock();
+      writer.releaseLock();
+      await stream.writable.close();
+    }
+  });
+
   it("sends DELETE and aborts SSE requests when closed", async () => {
     const controlledFetch = createControlledFetch();
     const stream = createHttpStream("https://agent.example/acp", {
@@ -330,6 +406,7 @@ interface RecordedRequest {
   readonly method: string;
   readonly headers: Headers;
   readonly body: string;
+  readonly credentials: RequestCredentials | undefined;
 }
 
 interface RecordedSseRequest {
@@ -349,7 +426,14 @@ interface TestClientState {
   readonly permissionRequests?: RequestPermissionRequest[];
 }
 
-function createControlledFetch(): ControlledFetch {
+interface ControlledFetchOptions {
+  readonly initializeCookies?: readonly string[];
+  readonly getCookies?: readonly string[];
+}
+
+function createControlledFetch(
+  options: ControlledFetchOptions = {},
+): ControlledFetch {
   const requests: RecordedRequest[] = [];
   const sseRequests: RecordedSseRequest[] = [];
   const encoder = new TextEncoder();
@@ -365,11 +449,13 @@ function createControlledFetch(): ControlledFetch {
         method,
         headers,
         body: bodyToString(init?.body),
+        credentials: init?.credentials,
       });
 
       if (method === "POST" && !headers.has(HEADER_CONNECTION_ID)) {
         return jsonResponse(initializeResponse, 200, {
           [HEADER_CONNECTION_ID]: "connection-1",
+          ...setCookieResponseHeaders(options.initializeCookies),
         });
       }
 
@@ -395,7 +481,10 @@ function createControlledFetch(): ControlledFetch {
 
         return new Response(stream.readable, {
           status: 200,
-          headers: { "Content-Type": EVENT_STREAM_MIME_TYPE },
+          headers: {
+            "Content-Type": EVENT_STREAM_MIME_TYPE,
+            ...setCookieResponseHeaders(options.getCookies),
+          },
         });
       }
 
@@ -484,4 +573,10 @@ function jsonResponse(
       ...headers,
     },
   });
+}
+
+function setCookieResponseHeaders(
+  cookies: readonly string[] | undefined,
+): Record<string, string> {
+  return cookies ? { "Set-Cookie": cookies.join(", ") } : {};
 }

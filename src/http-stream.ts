@@ -18,13 +18,15 @@ export interface HttpStreamOptions {
   readonly fetch?: typeof globalThis.fetch;
   /** Headers to include on every HTTP/SSE request. */
   readonly headers?: Record<string, string>;
+  /** Cookie handling policy for transport requests. Defaults to `include`. */
+  readonly cookies?: "include" | "omit";
 }
 
 /**
  * Creates an ACP Stream over Streamable HTTP.
  *
  * Uses POST for client messages and SSE GET streams for server messages.
- * Pass a custom `fetch` for cookies, auth, proxies, or non-browser runtimes.
+ * Cookies are included by default for the lifetime of one stream.
  */
 export function createHttpStream(
   serverUrl: string,
@@ -38,6 +40,8 @@ class HttpStreamTransport {
 
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly headers: Record<string, string>;
+  private readonly cookiePolicy: RequestCredentials;
+  private readonly cookieJar = new ConnectionCookieJar();
   private readonly abortController = new AbortController();
   private readonly knownSessions = new Set<string>();
 
@@ -54,6 +58,7 @@ class HttpStreamTransport {
   ) {
     this.fetchImpl = resolveFetch(options.fetch);
     this.headers = options.headers ?? {};
+    this.cookiePolicy = options.cookies ?? "include";
 
     this.stream = {
       readable: new ReadableStream<AnyMessage>({
@@ -95,10 +100,9 @@ class HttpStreamTransport {
       throw new Error("ACP HTTP stream first message must be initialize");
     }
 
-    const response = await this.fetchImpl(this.serverUrl, {
+    const response = await this.fetchRequest({
       method: "POST",
       headers: {
-        ...this.headers,
         "Content-Type": JSON_MIME_TYPE,
       },
       body: JSON.stringify(message),
@@ -130,10 +134,9 @@ class HttpStreamTransport {
     }
 
     const sessionId = sessionIdFromMessageParams(message);
-    const response = await this.fetchImpl(this.serverUrl, {
+    const response = await this.fetchRequest({
       method: "POST",
       headers: {
-        ...this.headers,
         "Content-Type": JSON_MIME_TYPE,
         [HEADER_CONNECTION_ID]: connectionId,
         ...(sessionId ? { [HEADER_SESSION_ID]: sessionId } : {}),
@@ -177,10 +180,9 @@ class HttpStreamTransport {
 
   private async openSse(headers: Record<string, string>): Promise<void> {
     try {
-      const response = await this.fetchImpl(this.serverUrl, {
+      const response = await this.fetchRequest({
         method: "GET",
         headers: {
-          ...this.headers,
           Accept: EVENT_STREAM_MIME_TYPE,
           ...headers,
         },
@@ -216,6 +218,35 @@ class HttpStreamTransport {
     }
   }
 
+  private async fetchRequest(init: RequestInit): Promise<Response> {
+    const response = await this.fetchImpl(this.serverUrl, {
+      ...init,
+      credentials: this.cookiePolicy,
+      headers: this.createRequestHeaders(init.headers),
+    });
+
+    if (this.cookiePolicy === "include") {
+      this.cookieJar.store(response.headers);
+    }
+
+    return response;
+  }
+
+  private createRequestHeaders(headers: HeadersInit | undefined): Headers {
+    const requestHeaders = new Headers(this.headers);
+    const transportHeaders = new Headers(headers);
+
+    transportHeaders.forEach((value, key) => {
+      requestHeaders.set(key, value);
+    });
+
+    if (this.cookiePolicy === "include") {
+      this.cookieJar.apply(requestHeaders);
+    }
+
+    return requestHeaders;
+  }
+
   private async close(): Promise<void> {
     if (this.isClosed) {
       return;
@@ -225,22 +256,23 @@ class HttpStreamTransport {
 
     const connectionId = this.connectionId;
     if (connectionId) {
-      const response = await this.fetchImpl(this.serverUrl, {
+      const response = await this.fetchRequest({
         method: "DELETE",
         headers: {
-          ...this.headers,
           [HEADER_CONNECTION_ID]: connectionId,
         },
       });
 
       if (!response.ok) {
         this.abortController.abort();
+        this.cookieJar.clear();
         this.closeReadable();
         throw await httpError("ACP DELETE failed", response);
       }
     }
 
     this.abortController.abort();
+    this.cookieJar.clear();
     this.closeReadable();
   }
 
@@ -259,6 +291,7 @@ class HttpStreamTransport {
 
     this.isClosed = true;
     this.abortController.abort();
+    this.cookieJar.clear();
 
     try {
       this.readableController?.error(error);
@@ -276,6 +309,48 @@ class HttpStreamTransport {
   }
 }
 
+class ConnectionCookieJar {
+  private readonly cookies = new Map<string, string>();
+
+  store(headers: Headers): void {
+    for (const value of setCookieHeaders(headers)) {
+      const cookie = parseSetCookie(value);
+      if (!cookie) {
+        continue;
+      }
+
+      this.cookies.set(cookie.name, cookie.value);
+    }
+  }
+
+  apply(headers: Headers): void {
+    const merged = mergeCookieHeaders(
+      this.cookieHeader(),
+      headers.get("Cookie"),
+    );
+    if (merged) {
+      headers.set("Cookie", merged);
+    }
+  }
+
+  clear(): void {
+    this.cookies.clear();
+  }
+
+  private cookieHeader(): string | undefined {
+    return this.cookies.size === 0
+      ? undefined
+      : Array.from(this.cookies)
+          .map(([name, value]) => `${name}=${value}`)
+          .join("; ");
+  }
+}
+
+interface CookiePair {
+  readonly name: string;
+  readonly value: string;
+}
+
 function resolveFetch(
   fetchImpl: typeof globalThis.fetch | undefined,
 ): typeof globalThis.fetch {
@@ -290,6 +365,104 @@ function resolveFetch(
   throw new Error(
     "createHttpStream requires globalThis.fetch or options.fetch",
   );
+}
+
+function setCookieHeaders(headers: Headers): string[] {
+  const getSetCookie = headers.getSetCookie;
+  if (typeof getSetCookie === "function") {
+    return getSetCookie.call(headers);
+  }
+
+  const setCookie = headers.get("Set-Cookie");
+  return setCookie ? splitSetCookieHeader(setCookie) : [];
+}
+
+function splitSetCookieHeader(header: string): string[] {
+  const result: string[] = [];
+  let start = 0;
+  let isInExpires = false;
+
+  for (let index = 0; index < header.length; index += 1) {
+    const char = header[index];
+
+    if (char === "," && !isInExpires) {
+      result.push(header.slice(start, index).trim());
+      start = index + 1;
+      continue;
+    }
+
+    if (header.slice(index, index + 8).toLowerCase() === "expires=") {
+      isInExpires = true;
+      index += 7;
+      continue;
+    }
+
+    if (char === ";" && isInExpires) {
+      isInExpires = false;
+    }
+  }
+
+  result.push(header.slice(start).trim());
+  return result.filter((value) => value.length > 0);
+}
+
+function parseSetCookie(header: string): CookiePair | undefined {
+  const pair = header.split(";", 1)[0];
+  const separator = pair.indexOf("=");
+
+  if (separator <= 0) {
+    return undefined;
+  }
+
+  return {
+    name: pair.slice(0, separator).trim(),
+    value: pair.slice(separator + 1).trim(),
+  };
+}
+
+function mergeCookieHeaders(
+  jarCookieHeader: string | undefined,
+  callerCookieHeader: string | null,
+): string | undefined {
+  const cookies = new Map<string, string>();
+
+  for (const cookie of parseCookieHeader(jarCookieHeader)) {
+    cookies.set(cookie.name, cookie.value);
+  }
+
+  for (const cookie of parseCookieHeader(callerCookieHeader ?? undefined)) {
+    cookies.set(cookie.name, cookie.value);
+  }
+
+  return cookies.size === 0
+    ? undefined
+    : Array.from(cookies)
+        .map(([name, value]) => `${name}=${value}`)
+        .join("; ");
+}
+
+function parseCookieHeader(header: string | undefined): CookiePair[] {
+  if (!header) {
+    return [];
+  }
+
+  return header
+    .split(";")
+    .map(parseCookiePair)
+    .filter((cookie): cookie is CookiePair => cookie !== undefined);
+}
+
+function parseCookiePair(value: string): CookiePair | undefined {
+  const separator = value.indexOf("=");
+
+  if (separator <= 0) {
+    return undefined;
+  }
+
+  return {
+    name: value.slice(0, separator).trim(),
+    value: value.slice(separator + 1).trim(),
+  };
 }
 
 async function httpError(prefix: string, response: Response): Promise<Error> {
