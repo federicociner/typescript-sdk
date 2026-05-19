@@ -4,6 +4,9 @@ This directory contains examples using the [ACP](https://agentclientprotocol.com
 
 - [`agent.ts`](./agent.ts) - A minimal agent implementation that simulates LLM interaction
 - [`client.ts`](./client.ts) - A minimal client implementation that spawns the [`agent.ts`](./agent.ts) as a subprocess
+- [`http-server.ts`](./http-server.ts) - A minimal ACP Streamable HTTP server with WebSocket upgrade support
+- [`http-client.ts`](./http-client.ts) - A minimal client using `createHttpStream`
+- [`ws-client.ts`](./ws-client.ts) - A minimal client using `createWebSocketStream`
 
 ## Running the Agent
 
@@ -75,3 +78,25 @@ npx tsx src/examples/client.ts
 ```
 
 This client will spawn the example agent as a subprocess, send a message, and print the content it receives from it.
+
+## Running the HTTP and WebSocket Examples
+
+Start the Streamable HTTP server with WebSocket upgrade support:
+
+```bash
+npx tsx src/examples/http-server.ts
+```
+
+In another terminal, run the HTTP client:
+
+```bash
+npx tsx src/examples/http-client.ts
+```
+
+Or run the WebSocket client:
+
+```bash
+npx tsx src/examples/ws-client.ts
+```
+
+The HTTP example sends a bearer token through custom request headers. The WebSocket example passes the Node `ws` constructor so custom headers can be sent during the WebSocket handshake. Browser WebSocket clients can use `createWebSocketStream` too, but browsers do not allow custom WebSocket headers.

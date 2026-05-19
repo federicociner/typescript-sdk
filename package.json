@@ -27,22 +27,27 @@
   "exports": {
     ".": {
       "types": "./dist/acp.d.ts",
+      "import": "./dist/acp.js",
       "default": "./dist/acp.js"
     },
     "./http-client": {
       "types": "./dist/http-stream.d.ts",
+      "import": "./dist/http-stream.js",
       "default": "./dist/http-stream.js"
     },
     "./ws-client": {
       "types": "./dist/ws-stream.d.ts",
+      "import": "./dist/ws-stream.js",
       "default": "./dist/ws-stream.js"
     },
     "./server": {
       "types": "./dist/server.d.ts",
+      "import": "./dist/server.js",
       "default": "./dist/server.js"
     },
     "./node": {
       "types": "./dist/node-adapter.d.ts",
+      "import": "./dist/node-adapter.js",
       "default": "./dist/node-adapter.js"
     },
     "./schema/schema.json": "./schema/schema.json"
@@ -67,7 +72,13 @@
     "docs:ts:verify": "cd src && typedoc --emit none && echo 'TypeDoc verification passed'"
   },
   "peerDependencies": {
+    "ws": ">=8.0.0",
     "zod": "^3.25.0 || ^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ws": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
