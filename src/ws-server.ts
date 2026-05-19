@@ -8,7 +8,7 @@ import {
   messageIdKey,
   sessionIdFromParams,
 } from "./protocol.js";
-
+import { onWebSocket, webSocketMessageToString } from "./ws-utils.js";
 import type { Agent, AgentSideConnection } from "./acp.js";
 import type {
   ConnectionRegistry,
@@ -16,6 +16,9 @@ import type {
   ResponseRoute,
 } from "./connection.js";
 import type { AnyMessage, AnyRequest } from "./jsonrpc.js";
+import type { WebSocketLike } from "./ws-utils.js";
+
+export type WebSocketServerSocket = WebSocketLike;
 
 type ForwardResult =
   | {
@@ -26,27 +29,13 @@ type ForwardResult =
       message: string;
     };
 
-export interface WebSocketServerSocket {
-  readonly readyState?: number;
-  send(data: string): void;
-  close(code?: number, reason?: string): void;
-  addEventListener?(type: string, listener: (event: unknown) => void): void;
-  removeEventListener?(type: string, listener: (event: unknown) => void): void;
-  on?(type: string, listener: (...args: unknown[]) => void): unknown;
-  off?(type: string, listener: (...args: unknown[]) => void): unknown;
-  removeListener?(
-    type: string,
-    listener: (...args: unknown[]) => void,
-  ): unknown;
-}
-
 export interface WebSocketConnectionOptions {
   readonly registry: ConnectionRegistry;
   readonly createAgent: (conn: AgentSideConnection) => Agent;
 }
 
 export function handleWebSocketConnection(
-  socket: WebSocketServerSocket,
+  socket: WebSocketLike,
   options: WebSocketConnectionOptions,
 ): void {
   const session = new WebSocketServerSession(socket, options);
@@ -56,29 +45,30 @@ export function handleWebSocketConnection(
 class WebSocketServerSession {
   private connection: ConnectionState | undefined;
   private outboundReader: ReadableStreamDefaultReader<AnyMessage> | undefined;
+  private inboundWriteChain: Promise<void> = Promise.resolve();
   private isClosed = false;
   private readonly detachListeners: Array<() => void> = [];
 
   constructor(
-    private readonly socket: WebSocketServerSocket,
+    private readonly socket: WebSocketLike,
     private readonly options: WebSocketConnectionOptions,
   ) {}
 
   start(): void {
     this.detachListeners.push(
-      onSocket(this.socket, "message", (...args) => {
+      onWebSocket(this.socket, "message", (...args) => {
         void this.handleSocketMessage(args);
       }),
     );
 
     this.detachListeners.push(
-      onSocket(this.socket, "close", () => {
+      onWebSocket(this.socket, "close", () => {
         void this.closeSession();
       }),
     );
 
     this.detachListeners.push(
-      onSocket(this.socket, "error", () => {
+      onWebSocket(this.socket, "error", () => {
         void this.shutdown(1011, "WebSocket error");
       }),
     );
@@ -89,7 +79,7 @@ class WebSocketServerSession {
       return;
     }
 
-    const text = socketMessageToString(args);
+    const text = webSocketMessageToString(args);
     if (text === undefined) {
       console.warn("Ignoring non-text ACP WebSocket frame");
       return;
@@ -202,17 +192,31 @@ class WebSocketServerSession {
         connection.pendingRoutes.set(key, route);
       }
 
-      await writeInbound(connection, message);
+      await this.writeInbound(message);
       return { ok: true };
     }
 
     if (isResponseMessage(message)) {
-      await writeInbound(connection, message);
+      await this.writeInbound(message);
       return { ok: true };
     }
 
-    await writeInbound(connection, message);
+    await this.writeInbound(message);
     return { ok: true };
+  }
+
+  private async writeInbound(message: AnyMessage): Promise<void> {
+    const connection = this.connection;
+
+    if (!connection) {
+      throw new Error("ACP WebSocket connection is not initialized");
+    }
+
+    const write = this.inboundWriteChain.then(() =>
+      writeInbound(connection, message),
+    );
+    this.inboundWriteChain = write.catch(() => undefined);
+    await write;
   }
 
   private startOutboundPump(connection: ConnectionState): void {
@@ -344,82 +348,4 @@ function determineWebSocketRoute(message: AnyRequest): ResponseRoute {
   }
 
   return "connection";
-}
-
-function onSocket(
-  socket: WebSocketServerSocket,
-  type: string,
-  listener: (...args: unknown[]) => void,
-): () => void {
-  if (socket.addEventListener) {
-    const eventListener = (event: unknown) => listener(event);
-    socket.addEventListener(type, eventListener);
-
-    return () => {
-      socket.removeEventListener?.(type, eventListener);
-    };
-  }
-
-  if (socket.on) {
-    socket.on(type, listener);
-
-    return () => {
-      if (socket.off) {
-        socket.off(type, listener);
-        return;
-      }
-
-      socket.removeListener?.(type, listener);
-    };
-  }
-
-  throw new Error("WebSocket object does not support event listeners");
-}
-
-function socketMessageToString(args: unknown[]): string | undefined {
-  const data = extractMessageData(args);
-
-  if (typeof data === "string") {
-    return data;
-  }
-
-  if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
-    return new TextDecoder().decode(data);
-  }
-
-  if (Array.isArray(data) && data.every(ArrayBuffer.isView)) {
-    return decodeArrayBufferViews(data);
-  }
-
-  return undefined;
-}
-
-function extractMessageData(args: unknown[]): unknown {
-  const [first] = args;
-
-  if (isMessageEventLike(first)) {
-    return first.data;
-  }
-
-  return first;
-}
-
-function isMessageEventLike(value: unknown): value is { data: unknown } {
-  return typeof value === "object" && value !== null && "data" in value;
-}
-
-function decodeArrayBufferViews(views: ArrayBufferView[]): string {
-  const totalLength = views.reduce((sum, view) => sum + view.byteLength, 0);
-  const combined = new Uint8Array(totalLength);
-  let offset = 0;
-
-  for (const view of views) {
-    combined.set(
-      new Uint8Array(view.buffer, view.byteOffset, view.byteLength),
-      offset,
-    );
-    offset += view.byteLength;
-  }
-
-  return new TextDecoder().decode(combined);
 }

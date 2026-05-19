@@ -1,4 +1,5 @@
 import http from "node:http";
+import { WebSocketServer } from "ws";
 
 import { AcpServer } from "../server.js";
 import { createNodeHttpHandler } from "../node-adapter.js";
@@ -9,6 +10,7 @@ import type { Agent, AgentSideConnection } from "../acp.js";
 
 export interface TestHttpServer {
   readonly url: string;
+  readonly wsUrl: string;
   readonly close: () => Promise<void>;
 }
 
@@ -19,6 +21,13 @@ export async function startTestServer(
 ): Promise<TestHttpServer> {
   const acpServer = new AcpServer({ createAgent: agentFactory });
   const httpServer = http.createServer(createNodeHttpHandler(acpServer));
+  const webSocketServer = new WebSocketServer({ noServer: true });
+
+  httpServer.on("upgrade", (req, socket, head) => {
+    webSocketServer.handleUpgrade(req, socket, head, (webSocket) => {
+      acpServer.handleWebSocket(webSocket);
+    });
+  });
 
   await listen(httpServer, options.port ?? 0);
 
@@ -30,8 +39,14 @@ export async function startTestServer(
 
   return {
     url: `http://127.0.0.1:${address.port}`,
+    wsUrl: `ws://127.0.0.1:${address.port}`,
     close: async () => {
-      await Promise.all([acpServer.close(), closeHttpServer(httpServer)]);
+      terminateWebSockets(webSocketServer);
+      await Promise.all([
+        acpServer.close(),
+        closeWebSocketServer(webSocketServer),
+        closeHttpServer(httpServer),
+      ]);
     },
   };
 }
@@ -51,6 +66,25 @@ function listen(server: http.Server, port: number): Promise<void> {
     server.once("error", onError);
     server.once("listening", onListening);
     server.listen(port, "127.0.0.1");
+  });
+}
+
+function terminateWebSockets(server: WebSocketServer): void {
+  for (const client of server.clients) {
+    client.terminate();
+  }
+}
+
+function closeWebSocketServer(server: WebSocketServer): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    });
   });
 }
 
