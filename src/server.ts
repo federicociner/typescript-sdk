@@ -28,10 +28,20 @@ import type {
   AnyResponse,
 } from "./jsonrpc.js";
 
+export type AgentFactory = (conn: AgentSideConnection) => Agent;
+
 /** Options for creating an ACP server transport. */
 export interface AcpServerOptions {
   /** Creates the agent implementation for each accepted ACP connection. */
-  createAgent: (conn: AgentSideConnection) => Agent;
+  createAgent: AgentFactory;
+}
+
+export interface HandleRequestOptions {
+  readonly createAgent?: AgentFactory;
+}
+
+export interface PrepareWebSocketUpgradeOptions {
+  readonly createAgent?: AgentFactory;
 }
 
 export interface PreparedWebSocketUpgrade {
@@ -48,7 +58,7 @@ export interface PreparedWebSocketUpgrade {
  * the `101 Switching Protocols` response.
  */
 export class AcpServer {
-  private readonly createAgent: (conn: AgentSideConnection) => Agent;
+  private readonly createAgent: AgentFactory;
   private readonly registry = new ConnectionRegistry();
 
   constructor(options: AcpServerOptions) {
@@ -56,9 +66,12 @@ export class AcpServer {
   }
 
   /** Handles one Streamable HTTP ACP request. */
-  async handleRequest(req: Request): Promise<Response> {
+  async handleRequest(
+    req: Request,
+    options: HandleRequestOptions = {},
+  ): Promise<Response> {
     if (req.method === "POST") {
-      return await this.handlePost(req);
+      return await this.handlePost(req, options);
     }
 
     if (req.method === "GET") {
@@ -73,8 +86,11 @@ export class AcpServer {
   }
 
   /** Creates a WebSocket connection before accepting the HTTP upgrade. */
-  prepareWebSocketUpgrade(): PreparedWebSocketUpgrade {
-    const connection = this.registry.createConnection(this.createAgent);
+  prepareWebSocketUpgrade(
+    options: PrepareWebSocketUpgradeOptions = {},
+  ): PreparedWebSocketUpgrade {
+    const createAgent = options.createAgent ?? this.createAgent;
+    const connection = this.registry.createConnection(createAgent);
     let isSettled = false;
 
     return {
@@ -87,7 +103,7 @@ export class AcpServer {
         isSettled = true;
         handleWebSocketConnection(socket, {
           registry: this.registry,
-          createAgent: this.createAgent,
+          createAgent,
           connection,
         });
       },
@@ -107,7 +123,10 @@ export class AcpServer {
     this.registry.closeAll();
   }
 
-  private async handlePost(req: Request): Promise<Response> {
+  private async handlePost(
+    req: Request,
+    options: HandleRequestOptions,
+  ): Promise<Response> {
     const contentType = req.headers.get("Content-Type");
 
     if (!isJsonContentType(contentType)) {
@@ -132,7 +151,7 @@ export class AcpServer {
 
     if (isInitializeRequest(body.value)) {
       if (!connectionId) {
-        return await this.handleInitialize(body.value);
+        return await this.handleInitialize(body.value, options);
       }
 
       return textResponse("Initialize not allowed on existing connection", 400);
@@ -210,7 +229,10 @@ export class AcpServer {
     return emptyResponse(202);
   }
 
-  private async handleInitialize(message: AnyMessage): Promise<Response> {
+  private async handleInitialize(
+    message: AnyMessage,
+    options: HandleRequestOptions,
+  ): Promise<Response> {
     if (!("id" in message) || message.id === null) {
       return textResponse("Initialize request must include an ID", 400);
     }
@@ -220,7 +242,9 @@ export class AcpServer {
       | undefined;
 
     try {
-      connection = this.registry.createConnection(this.createAgent);
+      connection = this.registry.createConnection(
+        options.createAgent ?? this.createAgent,
+      );
       await writeInbound(connection, message);
 
       const initialResponse = await connection.recvInitial(message.id);

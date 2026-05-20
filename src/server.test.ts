@@ -60,6 +60,193 @@ describe("AcpServer", () => {
     }
   });
 
+  it("uses the default factory for direct HTTP initialize requests", async () => {
+    const createdBy: string[] = [];
+    const server = new AcpServer({
+      createAgent: (conn: AgentSideConnection) => {
+        createdBy.push("default");
+        return new TestAgent(conn);
+      },
+    });
+
+    try {
+      const response = await server.handleRequest(
+        jsonRequest(initializeRequest),
+      );
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get(HEADER_CONNECTION_ID)).toMatch(
+        /^[0-9a-f-]{36}$/,
+      );
+      expect(createdBy).toEqual(["default"]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("uses per-request factory overrides for direct HTTP initialize requests", async () => {
+    const createdBy: string[] = [];
+    const server = new AcpServer({
+      createAgent: (conn: AgentSideConnection) => {
+        createdBy.push("default");
+        return new TestAgent(conn);
+      },
+    });
+
+    try {
+      const response = await server.handleRequest(
+        jsonRequest(initializeRequest),
+        {
+          createAgent: (conn) => {
+            createdBy.push("override");
+            return new TestAgent(conn);
+          },
+        },
+      );
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get(HEADER_CONNECTION_ID)).toMatch(
+        /^[0-9a-f-]{36}$/,
+      );
+      expect(createdBy).toEqual(["override"]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("does not leak HTTP factory overrides to later initialize requests", async () => {
+    const createdBy: string[] = [];
+    const server = new AcpServer({
+      createAgent: (conn: AgentSideConnection) => {
+        createdBy.push("default");
+        return new TestAgent(conn);
+      },
+    });
+
+    try {
+      await server.handleRequest(jsonRequest(initializeRequest), {
+        createAgent: (conn) => {
+          createdBy.push("override");
+          return new TestAgent(conn);
+        },
+      });
+      await server.handleRequest(jsonRequest({ ...initializeRequest, id: 2 }));
+
+      expect(createdBy).toEqual(["override", "default"]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps concurrent HTTP initialize factory overrides isolated", async () => {
+    const createdBy: string[] = [];
+    const server = new AcpServer({
+      createAgent: (conn: AgentSideConnection) => {
+        createdBy.push("default");
+        return new TestAgent(conn);
+      },
+    });
+
+    try {
+      const first = server.handleRequest(jsonRequest(initializeRequest), {
+        createAgent: (conn) => {
+          createdBy.push("first");
+          return new TestAgent(conn);
+        },
+      });
+      const second = server.handleRequest(
+        jsonRequest({ ...initializeRequest, id: 2 }),
+        {
+          createAgent: (conn) => {
+            createdBy.push("second");
+            return new TestAgent(conn);
+          },
+        },
+      );
+
+      await Promise.all([first, second]);
+
+      expect(createdBy).toEqual(expect.arrayContaining(["first", "second"]));
+      expect(createdBy).toHaveLength(2);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("ignores HTTP factory overrides for existing-connection POST requests", async () => {
+    const createdBy: string[] = [];
+    const server = new AcpServer({
+      createAgent: (conn: AgentSideConnection) => {
+        createdBy.push("default");
+        return new TestAgent(conn);
+      },
+    });
+
+    try {
+      const connectionId = await initializeDirect(server);
+      const response = await server.handleRequest(
+        jsonRequest(sessionNewRequest, {
+          [HEADER_CONNECTION_ID]: connectionId,
+        }),
+        {
+          createAgent: (conn) => {
+            createdBy.push("override");
+            return new TestAgent(conn);
+          },
+        },
+      );
+
+      expect(response.status).toBe(202);
+      expect(createdBy).toEqual(["default"]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("ignores HTTP factory overrides for GET and DELETE requests", async () => {
+    const createdBy: string[] = [];
+    const server = new AcpServer({
+      createAgent: (conn: AgentSideConnection) => {
+        createdBy.push("default");
+        return new TestAgent(conn);
+      },
+    });
+
+    try {
+      const connectionId = await initializeDirect(server);
+      const createAgent = (conn: AgentSideConnection): TestAgent => {
+        createdBy.push("override");
+        return new TestAgent(conn);
+      };
+      const getResponse = await server.handleRequest(
+        new Request("http://127.0.0.1/acp", {
+          method: "GET",
+          headers: {
+            Accept: EVENT_STREAM_MIME_TYPE,
+            [HEADER_CONNECTION_ID]: connectionId,
+          },
+        }),
+        { createAgent },
+      );
+
+      expect(getResponse.status).toBe(200);
+      await getResponse.body?.cancel();
+
+      const deleteResponse = await server.handleRequest(
+        new Request("http://127.0.0.1/acp", {
+          method: "DELETE",
+          headers: { [HEADER_CONNECTION_ID]: connectionId },
+        }),
+        { createAgent },
+      );
+
+      expect(deleteResponse.status).toBe(202);
+      expect(createdBy).toEqual(["default"]);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("streams session/new responses over the connection SSE stream", async () => {
     const server = await startTestServer();
 
@@ -471,6 +658,30 @@ describe("AcpServer", () => {
     }
   });
 });
+
+async function initializeDirect(server: AcpServer): Promise<string> {
+  const response = await server.handleRequest(jsonRequest(initializeRequest));
+  const connectionId = response.headers.get(HEADER_CONNECTION_ID);
+
+  expect(response.status).toBe(200);
+  expect(connectionId).toMatch(/^[0-9a-f-]{36}$/);
+
+  return connectionId ?? "";
+}
+
+function jsonRequest(
+  body: unknown,
+  headers: Record<string, string> = {},
+): Request {
+  return new Request("http://127.0.0.1/acp", {
+    method: "POST",
+    headers: {
+      "Content-Type": JSON_MIME_TYPE,
+      ...headers,
+    },
+    body: JSON.stringify(body),
+  });
+}
 
 async function initialize(url: string): Promise<string> {
   const response = await postJson(url, initializeRequest);
