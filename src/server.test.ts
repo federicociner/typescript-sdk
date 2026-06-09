@@ -363,7 +363,7 @@ describe("AcpServer", () => {
     }
   });
 
-  it("rejects session-scoped GETs for unknown sessions", async () => {
+  it("opens session-scoped GETs before session/load creates session state", async () => {
     const server = await startTestServer();
 
     try {
@@ -374,7 +374,8 @@ describe("AcpServer", () => {
         globalThis.crypto.randomUUID(),
       );
 
-      expect(response.status).toBe(404);
+      expect(response.status).toBe(200);
+      await response.body?.cancel();
     } finally {
       await server.close();
     }

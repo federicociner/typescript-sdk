@@ -3,7 +3,10 @@
 import { WebSocket } from "ws";
 
 import * as acp from "@agentclientprotocol/sdk";
-import { createWebSocketStream } from "@agentclientprotocol/sdk/ws-client";
+import {
+  MemoryAcpCookieStore,
+  createWebSocketStream,
+} from "@agentclientprotocol/sdk/ws-client";
 import type { WebSocketConstructor } from "@agentclientprotocol/sdk/ws-client";
 
 class WebSocketExampleClient implements acp.Client {
@@ -33,20 +36,37 @@ class WebSocketExampleClient implements acp.Client {
 }
 
 const serverUrl = process.env.ACP_WS_URL ?? "ws://127.0.0.1:7331/acp";
-const stream = createWebSocketStream(serverUrl, {
-  WebSocket: WebSocket satisfies WebSocketConstructor,
-  // Custom headers work with Node's `ws` constructor. Browser WebSocket does not support custom headers.
-  headers: {
-    Authorization: "Bearer example-token",
-  },
-});
-const connection = new acp.ClientSideConnection(
-  (_agent) => new WebSocketExampleClient(),
-  stream,
-);
+const authHeaders = {
+  Authorization: "Bearer example-token",
+};
+
+// Keep reconnect state outside individual stream instances. Browser WebSocket
+// uses the platform cookie jar; Node's `ws` uses constructor headers populated
+// from this store.
+const cookieStore = new MemoryAcpCookieStore();
+let savedSessionId: string | undefined;
+
+function connect(): {
+  readonly stream: acp.Stream;
+  readonly connection: acp.ClientSideConnection;
+} {
+  const stream = createWebSocketStream(serverUrl, {
+    WebSocket: WebSocket satisfies WebSocketConstructor,
+    headers: authHeaders,
+    cookieStore,
+  });
+  const connection = new acp.ClientSideConnection(
+    (_agent) => new WebSocketExampleClient(),
+    stream,
+  );
+
+  return { stream, connection };
+}
+
+const { stream, connection } = connect();
 
 try {
-  await connection.initialize({
+  const initialized = await connection.initialize({
     protocolVersion: acp.PROTOCOL_VERSION,
     clientCapabilities: {},
   });
@@ -55,6 +75,7 @@ try {
     cwd: process.cwd(),
     mcpServers: [],
   });
+  savedSessionId = session.sessionId;
 
   const result = await connection.prompt({
     sessionId: session.sessionId,
@@ -67,6 +88,21 @@ try {
   });
 
   console.log(`\nDone: ${result.stopReason}`);
+  console.log(
+    `Saved session ${savedSessionId}; loadSession=${initialized.agentCapabilities?.loadSession === true}`,
+  );
+
+  // Reconnect flow sketch:
+  // 1. Save `sessionId`, auth headers, cwd, MCP servers, and `cookieStore`.
+  // 2. Create a fresh WebSocket stream with the same auth headers and cookie store.
+  // 3. Call initialize and require `agentCapabilities.loadSession`.
+  // 4. Call session/load for the saved session ID.
+  // Production agents must authorize session/load for the authenticated user.
+  // ACP v1 does not replay in-flight transport messages emitted while disconnected.
+  // Example:
+  // const next = connect();
+  // await next.connection.initialize({ protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+  // await next.connection.loadSession({ sessionId: savedSessionId, cwd: process.cwd(), mcpServers: [] });
 } finally {
   await stream.writable.close();
 }

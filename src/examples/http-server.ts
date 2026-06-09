@@ -11,9 +11,18 @@ import {
 } from "@agentclientprotocol/sdk/node";
 import { AcpServer } from "@agentclientprotocol/sdk/server";
 
+interface DurableSessionState {
+  readonly cwd: string;
+  readonly history: acp.SessionNotification[];
+}
+
+// Illustrative durable state outside per-connection agent instances. For
+// production multi-node deployments, replace this with Redis, Postgres, shared
+// storage, or rely on sticky sessions with clear restart/drain semantics.
+const durableSessions = new Map<string, DurableSessionState>();
+
 class HttpExampleAgent implements acp.Agent {
   private readonly connection: acp.AgentSideConnection;
-  private readonly sessions = new Set<string>();
 
   constructor(connection: acp.AgentSideConnection) {
     this.connection = connection;
@@ -25,17 +34,38 @@ class HttpExampleAgent implements acp.Agent {
     return {
       protocolVersion: acp.PROTOCOL_VERSION,
       agentCapabilities: {
-        loadSession: false,
+        loadSession: true,
       },
     };
   }
 
   async newSession(
-    _params: acp.NewSessionRequest,
+    params: acp.NewSessionRequest,
   ): Promise<acp.NewSessionResponse> {
     const sessionId = crypto.randomUUID();
-    this.sessions.add(sessionId);
+    durableSessions.set(sessionId, {
+      cwd: params.cwd,
+      history: [],
+    });
     return { sessionId };
+  }
+
+  async loadSession(
+    params: acp.LoadSessionRequest,
+  ): Promise<acp.LoadSessionResponse> {
+    const session = durableSessions.get(params.sessionId);
+    if (!session) {
+      throw new Error(`Session ${params.sessionId} not found`);
+    }
+
+    // Production agents must authorize session/load against the authenticated
+    // principal before replaying durable state. This example's auth check lives
+    // in HTTP middleware and is intentionally minimal.
+    for (const update of session.history) {
+      await this.connection.sessionUpdate(update);
+    }
+
+    return {};
   }
 
   async authenticate(
@@ -45,20 +75,23 @@ class HttpExampleAgent implements acp.Agent {
   }
 
   async prompt(params: acp.PromptRequest): Promise<acp.PromptResponse> {
-    if (!this.sessions.has(params.sessionId)) {
+    const session = durableSessions.get(params.sessionId);
+    if (!session) {
       throw new Error(`Session ${params.sessionId} not found`);
     }
 
-    await this.connection.sessionUpdate({
+    const update: acp.SessionNotification = {
       sessionId: params.sessionId,
       update: {
         sessionUpdate: "agent_message_chunk",
         content: {
           type: "text",
-          text: "Hello from the ACP HTTP/WebSocket example server.",
+          text: `Hello from the ACP HTTP/WebSocket example server at ${session.cwd}.`,
         },
       },
-    });
+    };
+    session.history.push(update);
+    await this.connection.sessionUpdate(update);
 
     return { stopReason: "end_turn" };
   }

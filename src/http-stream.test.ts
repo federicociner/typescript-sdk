@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ClientSideConnection, PROTOCOL_VERSION } from "./acp.js";
-import { createHttpStream } from "./http-stream.js";
+import { MemoryAcpCookieStore, createHttpStream } from "./http-stream.js";
 import {
   EVENT_STREAM_MIME_TYPE,
   HEADER_CONNECTION_ID,
@@ -12,8 +12,17 @@ import { TestAgent } from "./test-support/test-agent.js";
 import { startTestServer } from "./test-support/test-http-server.js";
 
 import type {
+  Agent,
   AgentSideConnection,
   Client,
+  InitializeRequest,
+  InitializeResponse,
+  LoadSessionRequest,
+  LoadSessionResponse,
+  NewSessionRequest,
+  NewSessionResponse,
+  PromptRequest,
+  PromptResponse,
   RequestPermissionRequest,
   RequestPermissionResponse,
   SessionNotification,
@@ -317,6 +326,193 @@ describe("createHttpStream", () => {
     }
   });
 
+  it("clears SDK-owned ephemeral cookies when the stream errors", async () => {
+    const clearSpy = vi.spyOn(MemoryAcpCookieStore.prototype, "clear");
+    const controlledFetch = createControlledFetch({
+      initializeCookies: ["transport=alpha; Path=/"],
+      getStatus: 500,
+    });
+    const stream = createHttpStream("https://agent.example/acp", {
+      fetch: controlledFetch.fetch,
+    });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await writer.write(initializeRequest);
+      expect(await readMessage(reader)).toEqual(initializeResponse);
+
+      await expect(reader.read()).rejects.toThrow("ACP SSE connection failed");
+      expect(clearSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      clearSpy.mockRestore();
+      reader.releaseLock();
+      writer.releaseLock();
+      await stream.writable.close();
+    }
+  });
+
+  it("preserves caller-owned cookies when the stream errors", async () => {
+    const cookieStore = new MemoryAcpCookieStore();
+    const clearSpy = vi.spyOn(cookieStore, "clear");
+    const firstFetch = createControlledFetch({
+      initializeCookies: ["transport=alpha; Path=/"],
+      getStatus: 500,
+    });
+    const firstStream = createHttpStream("https://agent.example/acp", {
+      fetch: firstFetch.fetch,
+      cookieStore,
+    });
+    const firstWriter = firstStream.writable.getWriter();
+    const firstReader = firstStream.readable.getReader();
+
+    try {
+      await firstWriter.write(initializeRequest);
+      expect(await readMessage(firstReader)).toEqual(initializeResponse);
+      await expect(firstReader.read()).rejects.toThrow(
+        "ACP SSE connection failed",
+      );
+      expect(clearSpy).not.toHaveBeenCalled();
+    } finally {
+      clearSpy.mockRestore();
+      firstReader.releaseLock();
+      firstWriter.releaseLock();
+      await firstStream.writable.close();
+    }
+
+    const secondFetch = createControlledFetch();
+    const secondStream = createHttpStream("https://agent.example/acp", {
+      fetch: secondFetch.fetch,
+      cookieStore,
+    });
+    const secondWriter = secondStream.writable.getWriter();
+    const secondReader = secondStream.readable.getReader();
+
+    try {
+      await secondWriter.write(initializeRequest);
+      await readMessage(secondReader);
+
+      expect(requestAt(secondFetch.requests, 0).headers.get("Cookie")).toBe(
+        "transport=alpha",
+      );
+    } finally {
+      secondReader.releaseLock();
+      secondWriter.releaseLock();
+      await secondStream.writable.close();
+    }
+  });
+
+  it("preserves caller-owned cookies across separate stream instances", async () => {
+    const cookieStore = new MemoryAcpCookieStore();
+    const firstFetch = createControlledFetch({
+      initializeCookies: ["transport=alpha; Path=/"],
+    });
+    const firstStream = createHttpStream("https://agent.example/acp", {
+      fetch: firstFetch.fetch,
+      cookieStore,
+    });
+    const firstWriter = firstStream.writable.getWriter();
+    const firstReader = firstStream.readable.getReader();
+
+    try {
+      await firstWriter.write(initializeRequest);
+      await readMessage(firstReader);
+      await firstWriter.close();
+    } finally {
+      firstReader.releaseLock();
+      firstWriter.releaseLock();
+    }
+
+    const secondFetch = createControlledFetch();
+    const secondStream = createHttpStream("https://agent.example/acp", {
+      fetch: secondFetch.fetch,
+      cookieStore,
+    });
+    const secondWriter = secondStream.writable.getWriter();
+    const secondReader = secondStream.readable.getReader();
+
+    try {
+      await secondWriter.write(initializeRequest);
+      await readMessage(secondReader);
+
+      expect(requestAt(secondFetch.requests, 0).headers.get("Cookie")).toBe(
+        "transport=alpha",
+      );
+    } finally {
+      secondReader.releaseLock();
+      secondWriter.releaseLock();
+      await secondStream.writable.close();
+    }
+  });
+
+  it("clears SDK-owned ephemeral cookies when the stream closes", async () => {
+    const firstFetch = createControlledFetch({
+      initializeCookies: ["transport=alpha; Path=/"],
+    });
+    const firstStream = createHttpStream("https://agent.example/acp", {
+      fetch: firstFetch.fetch,
+    });
+    const firstWriter = firstStream.writable.getWriter();
+    const firstReader = firstStream.readable.getReader();
+
+    try {
+      await firstWriter.write(initializeRequest);
+      await readMessage(firstReader);
+      await firstWriter.close();
+    } finally {
+      firstReader.releaseLock();
+      firstWriter.releaseLock();
+    }
+
+    const secondFetch = createControlledFetch();
+    const secondStream = createHttpStream("https://agent.example/acp", {
+      fetch: secondFetch.fetch,
+    });
+    const secondWriter = secondStream.writable.getWriter();
+    const secondReader = secondStream.readable.getReader();
+
+    try {
+      await secondWriter.write(initializeRequest);
+      await readMessage(secondReader);
+
+      expect(
+        requestAt(secondFetch.requests, 0).headers.get("Cookie"),
+      ).toBeNull();
+    } finally {
+      secondReader.releaseLock();
+      secondWriter.releaseLock();
+      await secondStream.writable.close();
+    }
+  });
+
+  it("lets caller Cookie headers override caller-owned store values", async () => {
+    const cookieStore = new MemoryAcpCookieStore();
+    cookieStore.store(headersWithSetCookie(["transport=alpha", "route=bravo"]));
+    const controlledFetch = createControlledFetch();
+    const stream = createHttpStream("https://agent.example/acp", {
+      fetch: controlledFetch.fetch,
+      cookieStore,
+      headers: {
+        Cookie: "route=caller; caller=custom",
+      },
+    });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await writer.write(initializeRequest);
+      await readMessage(reader);
+
+      expect(requestAt(controlledFetch.requests, 0).headers.get("Cookie")).toBe(
+        "transport=alpha; route=caller; caller=custom",
+      );
+    } finally {
+      reader.releaseLock();
+      writer.releaseLock();
+      await stream.writable.close();
+    }
+  });
+
   it("sends DELETE and aborts SSE requests when closed", async () => {
     const controlledFetch = createControlledFetch();
     const stream = createHttpStream("https://agent.example/acp", {
@@ -450,6 +646,75 @@ describe("createHttpStream", () => {
     }
   });
 
+  it("loads durable sessions after an HTTP reconnect", async () => {
+    const durableSessions = new Map<string, DurableSessionState>();
+    const connectionIds: string[] = [];
+    const fetch = recordInitializeConnectionIds(connectionIds);
+    const server = await startTestServer(
+      (conn: AgentSideConnection) =>
+        new DurableSessionAgent(conn, durableSessions),
+    );
+
+    try {
+      const firstUpdates: SessionNotification[] = [];
+      const firstStream = createHttpStream(server.url, { fetch });
+      const firstConn = new ClientSideConnection(
+        () => createTestClient({ updates: firstUpdates }),
+        firstStream,
+      );
+      const initialized = await firstConn.initialize({
+        protocolVersion: PROTOCOL_VERSION,
+        clientCapabilities: {},
+      });
+      expect(initialized.agentCapabilities?.loadSession).toBe(true);
+      const session = await firstConn.newSession({
+        cwd: "/tmp",
+        mcpServers: [],
+      });
+      await expect(
+        firstConn.prompt({
+          sessionId: session.sessionId,
+          prompt: [{ type: "text", text: "Remember this" }],
+        }),
+      ).resolves.toEqual({ stopReason: "end_turn" });
+      await waitForUpdates(firstUpdates, 1);
+      await closeStream(firstStream);
+
+      expect(durableSessions.has(session.sessionId)).toBe(true);
+
+      const secondUpdates: SessionNotification[] = [];
+      const secondStream = createHttpStream(server.url, { fetch });
+      const secondConn = new ClientSideConnection(
+        () => createTestClient({ updates: secondUpdates }),
+        secondStream,
+      );
+      const reinitialized = await secondConn.initialize({
+        protocolVersion: PROTOCOL_VERSION,
+        clientCapabilities: {},
+      });
+      expect(reinitialized.agentCapabilities?.loadSession).toBe(true);
+
+      // Production agents must authorize session/load against the authenticated
+      // principal. This SDK transport test omits auth because there is no
+      // generic auth layer in the SDK.
+      await expect(
+        secondConn.loadSession({
+          sessionId: session.sessionId,
+          cwd: "/tmp",
+          mcpServers: [],
+        }),
+      ).resolves.toEqual({});
+      await waitForUpdates(secondUpdates, firstUpdates.length);
+      await closeStream(secondStream);
+
+      expect(connectionIds).toHaveLength(2);
+      expect(connectionIds[0]).not.toBe(connectionIds[1]);
+      expect(secondUpdates).toEqual(firstUpdates);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("keeps multiple sessions isolated through the SDK client abstraction", async () => {
     const updates: SessionNotification[] = [];
     const server = await startTestServer();
@@ -505,6 +770,79 @@ describe("createHttpStream", () => {
   });
 });
 
+interface DurableSessionState {
+  readonly cwd: string;
+  readonly history: SessionNotification[];
+}
+
+class DurableSessionAgent implements Agent {
+  constructor(
+    private readonly connection: AgentSideConnection,
+    private readonly sessions: Map<string, DurableSessionState>,
+  ) {}
+
+  initialize(_params: InitializeRequest): Promise<InitializeResponse> {
+    return Promise.resolve({
+      protocolVersion: PROTOCOL_VERSION,
+      agentCapabilities: {
+        loadSession: true,
+      },
+    });
+  }
+
+  newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    const sessionId = globalThis.crypto.randomUUID();
+    this.sessions.set(sessionId, {
+      cwd: params.cwd,
+      history: [],
+    });
+    return Promise.resolve({ sessionId });
+  }
+
+  async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    const session = this.sessions.get(params.sessionId);
+    if (!session) {
+      throw new Error(`Unknown durable session: ${params.sessionId}`);
+    }
+
+    for (const update of session.history) {
+      await this.connection.sessionUpdate(update);
+    }
+
+    return {};
+  }
+
+  async prompt(params: PromptRequest): Promise<PromptResponse> {
+    const session = this.sessions.get(params.sessionId);
+    if (!session) {
+      throw new Error(`Unknown durable session: ${params.sessionId}`);
+    }
+
+    const update: SessionNotification = {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: `durable-history:${session.cwd}`,
+        },
+      },
+    };
+    session.history.push(update);
+    await this.connection.sessionUpdate(update);
+
+    return { stopReason: "end_turn" };
+  }
+
+  cancel(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  authenticate(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
 interface RecordedRequest {
   readonly url: string;
   readonly method: string;
@@ -533,6 +871,25 @@ interface TestClientState {
 interface ControlledFetchOptions {
   readonly initializeCookies?: readonly string[];
   readonly getCookies?: readonly string[];
+  readonly getStatus?: number;
+}
+
+function recordInitializeConnectionIds(
+  connectionIds: string[],
+): typeof globalThis.fetch {
+  return async (input, init) => {
+    const response = await globalThis.fetch(input, init);
+    const headers = new Headers(init?.headers);
+
+    if (init?.method === "POST" && !headers.has(HEADER_CONNECTION_ID)) {
+      const connectionId = response.headers.get(HEADER_CONNECTION_ID);
+      if (connectionId) {
+        connectionIds.push(connectionId);
+      }
+    }
+
+    return response;
+  };
 }
 
 function createControlledFetch(
@@ -568,6 +925,14 @@ function createControlledFetch(
       }
 
       if (method === "GET") {
+        const status = options.getStatus ?? 200;
+        if (status !== 200) {
+          return new Response("SSE failed", {
+            status,
+            headers: setCookieResponseHeaders(options.getCookies),
+          });
+        }
+
         const stream = new TransformStream<Uint8Array, Uint8Array>();
         const writer = stream.writable.getWriter();
         const signal = init?.signal;
@@ -637,6 +1002,20 @@ async function readMessage(
   return result.value;
 }
 
+async function waitForUpdates(
+  updates: readonly SessionNotification[],
+  count: number,
+): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (updates.length < count) {
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out waiting for ${count} session updates`);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
 function requestAt(
   requests: readonly RecordedRequest[],
   index: number,
@@ -677,6 +1056,16 @@ function jsonResponse(
       ...headers,
     },
   });
+}
+
+function headersWithSetCookie(values: readonly string[]): Headers {
+  const headers = new Headers();
+
+  Object.defineProperty(headers, "getSetCookie", {
+    value: () => values,
+  });
+
+  return headers;
 }
 
 function setCookieResponseHeaders(

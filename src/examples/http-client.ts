@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 
 import * as acp from "@agentclientprotocol/sdk";
-import { createHttpStream } from "@agentclientprotocol/sdk/http-client";
+import {
+  MemoryAcpCookieStore,
+  createHttpStream,
+} from "@agentclientprotocol/sdk/http-client";
 
 class HttpExampleClient implements acp.Client {
   async requestPermission(
@@ -30,19 +33,36 @@ class HttpExampleClient implements acp.Client {
 }
 
 const serverUrl = process.env.ACP_HTTP_URL ?? "http://127.0.0.1:7331/acp";
-const stream = createHttpStream(serverUrl, {
-  headers: {
-    Authorization: "Bearer example-token",
-  },
-  // Cookies are included by default and scoped to this stream. Use `cookies: "omit"` for stateless requests.
-});
-const connection = new acp.ClientSideConnection(
-  (_agent) => new HttpExampleClient(),
-  stream,
-);
+const authHeaders = {
+  Authorization: "Bearer example-token",
+};
+
+// Keep reconnect state outside individual stream instances. Reuse this store
+// across fresh streams so an external affinity layer can route reconnects.
+const cookieStore = new MemoryAcpCookieStore();
+let savedSessionId: string | undefined;
+
+function connect(): {
+  readonly stream: acp.Stream;
+  readonly connection: acp.ClientSideConnection;
+} {
+  const stream = createHttpStream(serverUrl, {
+    headers: authHeaders,
+    cookieStore,
+    // Cookies are included by default. Use `cookies: "omit"` for stateless requests.
+  });
+  const connection = new acp.ClientSideConnection(
+    (_agent) => new HttpExampleClient(),
+    stream,
+  );
+
+  return { stream, connection };
+}
+
+const { stream, connection } = connect();
 
 try {
-  await connection.initialize({
+  const initialized = await connection.initialize({
     protocolVersion: acp.PROTOCOL_VERSION,
     clientCapabilities: {},
   });
@@ -51,6 +71,7 @@ try {
     cwd: process.cwd(),
     mcpServers: [],
   });
+  savedSessionId = session.sessionId;
 
   const result = await connection.prompt({
     sessionId: session.sessionId,
@@ -63,6 +84,22 @@ try {
   });
 
   console.log(`\nDone: ${result.stopReason}`);
+
+  console.log(
+    `Saved session ${savedSessionId}; loadSession=${initialized.agentCapabilities?.loadSession === true}`,
+  );
+
+  // Reconnect flow sketch:
+  // 1. Save `sessionId`, auth headers, cwd, MCP servers, and `cookieStore`.
+  // 2. Create a fresh stream with the same auth headers and cookie store.
+  // 3. Call initialize and require `agentCapabilities.loadSession`.
+  // 4. Call session/load for the saved session ID.
+  // Production agents must authorize session/load for the authenticated user.
+  // ACP v1 does not replay in-flight transport messages emitted while disconnected.
+  // Example:
+  // const next = connect();
+  // await next.connection.initialize({ protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+  // await next.connection.loadSession({ sessionId: savedSessionId, cwd: process.cwd(), mcpServers: [] });
 } finally {
   await stream.writable.close();
 }

@@ -40,9 +40,6 @@ describe("protocol transport helpers", () => {
     expect(methodRequiresSessionHeader(AGENT_METHODS.session_set_mode)).toBe(
       true,
     );
-    expect(methodRequiresSessionHeader(AGENT_METHODS.session_set_model)).toBe(
-      true,
-    );
   });
 
   it("does not require a session header for connection-level or unsupported methods", () => {

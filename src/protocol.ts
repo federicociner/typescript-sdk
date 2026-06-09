@@ -15,7 +15,6 @@ const SESSION_SCOPED_METHODS = new Set<string>([
   AGENT_METHODS.session_resume,
   AGENT_METHODS.session_set_config_option,
   AGENT_METHODS.session_set_mode,
-  AGENT_METHODS.session_set_model,
 ]);
 
 export function methodRequiresSessionHeader(method: string): boolean {

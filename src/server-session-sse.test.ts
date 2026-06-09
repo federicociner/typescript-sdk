@@ -313,6 +313,11 @@ describe("AcpServer session SSE", () => {
       const connectionId = await initialize(server.url);
       const sessionId = "existing-session";
       const connectionSse = await openConnectionSse(server.url, connectionId);
+      const sessionSse = await openSessionSse(
+        server.url,
+        connectionId,
+        sessionId,
+      );
       const accepted = await postJson(
         server.url,
         createLoadSessionRequest(3, sessionId),
@@ -321,14 +326,9 @@ describe("AcpServer session SSE", () => {
           [HEADER_SESSION_ID]: sessionId,
         },
       );
-      const sessionSse = await openSessionSse(
-        server.url,
-        connectionId,
-        sessionId,
-      );
 
-      expect(accepted.status).toBe(202);
       expect(sessionSse.status).toBe(200);
+      expect(accepted.status).toBe(202);
       expect(await readSseMessages(sessionSse, 1)).toMatchObject([
         {
           jsonrpc: "2.0",

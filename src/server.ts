@@ -204,12 +204,7 @@ export class AcpServer {
 
     const sessionId = req.headers.get(HEADER_SESSION_ID);
     if (sessionId) {
-      const sessionStream = connection.sessionStreams.get(sessionId);
-      if (!sessionStream) {
-        return textResponse("Unknown Acp-Session-Id", 404);
-      }
-
-      return sseResponse(sessionStream.subscribe());
+      return sseResponse(connection.ensureSession(sessionId).subscribe());
     }
 
     return sseResponse(connection.connectionStream.subscribe());

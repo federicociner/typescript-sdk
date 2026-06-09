@@ -9,8 +9,10 @@ import {
   sessionIdFromMessageParams,
   sessionIdFromResponseResult,
 } from "./protocol.js";
+import { MemoryAcpCookieStore } from "./cookie-store.js";
 import { parseSseStream } from "./sse.js";
 
+import type { AcpCookieStore } from "./cookie-store.js";
 import type { AnyMessage } from "./jsonrpc.js";
 import type { Stream } from "./stream.js";
 
@@ -21,13 +23,30 @@ export interface HttpStreamOptions {
   readonly headers?: Record<string, string>;
   /** Cookie handling policy for transport requests. Defaults to `include`. */
   readonly cookies?: "include" | "omit";
+  /**
+   * Caller-owned affinity cookie store to reuse across reconnects.
+   *
+   * If omitted, the SDK creates an ephemeral per-stream store and clears it
+   * when the stream closes/errors.
+   */
+  readonly cookieStore?: AcpCookieStore;
 }
+
+export { MemoryAcpCookieStore } from "./cookie-store.js";
+export type { AcpCookieStore } from "./cookie-store.js";
 
 /**
  * Creates an ACP Stream over Streamable HTTP.
  *
  * Uses POST for client messages and SSE GET streams for server messages.
- * Cookies are included by default for the lifetime of one stream.
+ * Cookies are included by default. Pass a caller-owned `AcpCookieStore` to
+ * retain affinity cookies across fresh streams during reconnect.
+ *
+ * ACP v1 reconnect creates a new transport connection; callers should save the
+ * ACP `sessionId`, create a new stream with the same auth headers/cookie store,
+ * call `initialize`, verify `agentCapabilities.loadSession`, then call
+ * `session/load`. Agents must authorize `session/load`, and ACP v1 does not
+ * replay in-flight transport messages emitted while disconnected.
  */
 export function createHttpStream(
   serverUrl: string,
@@ -42,7 +61,8 @@ class HttpStreamTransport {
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly headers: Record<string, string>;
   private readonly cookiePolicy: RequestCredentials;
-  private readonly cookieJar = new ConnectionCookieJar();
+  private readonly cookieStore: AcpCookieStore;
+  private readonly ownsCookieStore: boolean;
   private readonly abortController = new AbortController();
   private readonly knownSessions = new Set<string>();
   private readonly pendingResponseSessions = new Map<string, string>();
@@ -61,6 +81,8 @@ class HttpStreamTransport {
     this.fetchImpl = resolveFetch(options.fetch);
     this.headers = options.headers ?? {};
     this.cookiePolicy = options.cookies ?? "include";
+    this.cookieStore = options.cookieStore ?? new MemoryAcpCookieStore();
+    this.ownsCookieStore = options.cookieStore === undefined;
 
     this.stream = {
       readable: new ReadableStream<AnyMessage>({
@@ -261,7 +283,7 @@ class HttpStreamTransport {
     });
 
     if (this.cookiePolicy === "include") {
-      this.cookieJar.store(response.headers);
+      this.cookieStore.store(response.headers);
     }
 
     return response;
@@ -276,7 +298,7 @@ class HttpStreamTransport {
     });
 
     if (this.cookiePolicy === "include") {
-      this.cookieJar.apply(requestHeaders);
+      this.cookieStore.apply(requestHeaders);
     }
 
     return requestHeaders;
@@ -300,15 +322,21 @@ class HttpStreamTransport {
 
       if (!response.ok) {
         this.abortController.abort();
-        this.cookieJar.clear();
+        this.clearOwnedCookieStore();
         this.closeReadable();
         throw await httpError("ACP DELETE failed", response);
       }
     }
 
     this.abortController.abort();
-    this.cookieJar.clear();
+    this.clearOwnedCookieStore();
     this.closeReadable();
+  }
+
+  private clearOwnedCookieStore(): void {
+    if (this.ownsCookieStore) {
+      this.cookieStore.clear();
+    }
   }
 
   private enqueue(message: AnyMessage): void {
@@ -326,7 +354,7 @@ class HttpStreamTransport {
 
     this.isClosed = true;
     this.abortController.abort();
-    this.cookieJar.clear();
+    this.clearOwnedCookieStore();
 
     try {
       this.readableController?.error(error);
@@ -344,48 +372,6 @@ class HttpStreamTransport {
   }
 }
 
-class ConnectionCookieJar {
-  private readonly cookies = new Map<string, string>();
-
-  store(headers: Headers): void {
-    for (const value of setCookieHeaders(headers)) {
-      const cookie = parseSetCookie(value);
-      if (!cookie) {
-        continue;
-      }
-
-      this.cookies.set(cookie.name, cookie.value);
-    }
-  }
-
-  apply(headers: Headers): void {
-    const merged = mergeCookieHeaders(
-      this.cookieHeader(),
-      headers.get("Cookie"),
-    );
-    if (merged) {
-      headers.set("Cookie", merged);
-    }
-  }
-
-  clear(): void {
-    this.cookies.clear();
-  }
-
-  private cookieHeader(): string | undefined {
-    return this.cookies.size === 0
-      ? undefined
-      : Array.from(this.cookies)
-          .map(([name, value]) => `${name}=${value}`)
-          .join("; ");
-  }
-}
-
-interface CookiePair {
-  readonly name: string;
-  readonly value: string;
-}
-
 function resolveFetch(
   fetchImpl: typeof globalThis.fetch | undefined,
 ): typeof globalThis.fetch {
@@ -400,104 +386,6 @@ function resolveFetch(
   throw new Error(
     "createHttpStream requires globalThis.fetch or options.fetch",
   );
-}
-
-function setCookieHeaders(headers: Headers): string[] {
-  const getSetCookie = headers.getSetCookie;
-  if (typeof getSetCookie === "function") {
-    return getSetCookie.call(headers);
-  }
-
-  const setCookie = headers.get("Set-Cookie");
-  return setCookie ? splitSetCookieHeader(setCookie) : [];
-}
-
-function splitSetCookieHeader(header: string): string[] {
-  const result: string[] = [];
-  let start = 0;
-  let isInExpires = false;
-
-  for (let index = 0; index < header.length; index += 1) {
-    const char = header[index];
-
-    if (char === "," && !isInExpires) {
-      result.push(header.slice(start, index).trim());
-      start = index + 1;
-      continue;
-    }
-
-    if (header.slice(index, index + 8).toLowerCase() === "expires=") {
-      isInExpires = true;
-      index += 7;
-      continue;
-    }
-
-    if (char === ";" && isInExpires) {
-      isInExpires = false;
-    }
-  }
-
-  result.push(header.slice(start).trim());
-  return result.filter((value) => value.length > 0);
-}
-
-function parseSetCookie(header: string): CookiePair | undefined {
-  const pair = header.split(";", 1)[0];
-  const separator = pair.indexOf("=");
-
-  if (separator <= 0) {
-    return undefined;
-  }
-
-  return {
-    name: pair.slice(0, separator).trim(),
-    value: pair.slice(separator + 1).trim(),
-  };
-}
-
-function mergeCookieHeaders(
-  jarCookieHeader: string | undefined,
-  callerCookieHeader: string | null,
-): string | undefined {
-  const cookies = new Map<string, string>();
-
-  for (const cookie of parseCookieHeader(jarCookieHeader)) {
-    cookies.set(cookie.name, cookie.value);
-  }
-
-  for (const cookie of parseCookieHeader(callerCookieHeader ?? undefined)) {
-    cookies.set(cookie.name, cookie.value);
-  }
-
-  return cookies.size === 0
-    ? undefined
-    : Array.from(cookies)
-        .map(([name, value]) => `${name}=${value}`)
-        .join("; ");
-}
-
-function parseCookieHeader(header: string | undefined): CookiePair[] {
-  if (!header) {
-    return [];
-  }
-
-  return header
-    .split(";")
-    .map(parseCookiePair)
-    .filter((cookie): cookie is CookiePair => cookie !== undefined);
-}
-
-function parseCookiePair(value: string): CookiePair | undefined {
-  const separator = value.indexOf("=");
-
-  if (separator <= 0) {
-    return undefined;
-  }
-
-  return {
-    name: value.slice(0, separator).trim(),
-    value: value.slice(separator + 1).trim(),
-  };
 }
 
 async function httpError(prefix: string, response: Response): Promise<Error> {

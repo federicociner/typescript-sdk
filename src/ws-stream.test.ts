@@ -3,14 +3,23 @@ import { WebSocket } from "ws";
 
 import { ClientSideConnection, PROTOCOL_VERSION } from "./acp.js";
 import { HEADER_CONNECTION_ID } from "./protocol.js";
-import { createWebSocketStream } from "./ws-stream.js";
+import { MemoryAcpCookieStore, createWebSocketStream } from "./ws-stream.js";
 import { TestAgent } from "./test-support/test-agent.js";
 import { startTestServer } from "./test-support/test-http-server.js";
 
 import type { IncomingMessage } from "node:http";
 import type {
+  Agent,
   AgentSideConnection,
   Client,
+  InitializeRequest,
+  InitializeResponse,
+  LoadSessionRequest,
+  LoadSessionResponse,
+  NewSessionRequest,
+  NewSessionResponse,
+  PromptRequest,
+  PromptResponse,
   RequestPermissionRequest,
   RequestPermissionResponse,
   SessionNotification,
@@ -190,6 +199,107 @@ describe("createWebSocketStream", () => {
     }
   });
 
+  it("passes managed cookies and custom headers to custom WebSocket constructors", async () => {
+    const cookieStore = new MemoryAcpCookieStore();
+    cookieStore.store(headersWithSetCookie(["transport=alpha", "route=bravo"]));
+    const instances: FakeWebSocket[] = [];
+    const stream = createWebSocketStream("ws://agent.example/acp", {
+      WebSocket: createFakeWebSocketConstructor(instances),
+      cookieStore,
+      headers: {
+        Authorization: "Bearer token",
+        Cookie: "route=caller; caller=custom",
+      },
+    });
+
+    try {
+      const socket = fakeSocketAt(instances, 0);
+      expect(socket.options).toEqual({
+        headers: {
+          Authorization: "Bearer token",
+          Cookie: "transport=alpha; route=caller; caller=custom",
+        },
+      });
+      socket.open();
+    } finally {
+      await closeStream(stream);
+    }
+  });
+
+  it("stores upgrade cookies for reuse by later WebSocket streams", async () => {
+    const cookieStore = new MemoryAcpCookieStore();
+    const instances: FakeWebSocket[] = [];
+    const WebSocket = createFakeWebSocketConstructor(instances);
+    const firstStream = createWebSocketStream("ws://agent.example/acp", {
+      WebSocket,
+      cookieStore,
+    });
+
+    const firstSocket = fakeSocketAt(instances, 0);
+    firstSocket.upgrade({
+      headers: {
+        "set-cookie": ["transport=alpha; Path=/"],
+      },
+    });
+    firstSocket.open();
+    await closeStream(firstStream);
+
+    const secondStream = createWebSocketStream("ws://agent.example/acp", {
+      WebSocket,
+      cookieStore,
+    });
+
+    try {
+      const secondSocket = fakeSocketAt(instances, 1);
+      expect(secondSocket.options).toEqual({
+        headers: {
+          Cookie: "transport=alpha",
+        },
+      });
+      secondSocket.open();
+    } finally {
+      await closeStream(secondStream);
+    }
+  });
+
+  it("omits managed cookies and upgrade cookie storage when cookies are disabled", async () => {
+    const cookieStore = new MemoryAcpCookieStore();
+    const instances: FakeWebSocket[] = [];
+    const WebSocket = createFakeWebSocketConstructor(instances);
+    const firstStream = createWebSocketStream("ws://agent.example/acp", {
+      WebSocket,
+      cookieStore,
+      cookies: "omit",
+    });
+
+    const firstSocket = fakeSocketAt(instances, 0);
+    expect(firstSocket.options).toEqual({
+      headers: undefined,
+    });
+    firstSocket.upgrade({
+      headers: {
+        "set-cookie": ["transport=alpha; Path=/"],
+      },
+    });
+    firstSocket.open();
+    await closeStream(firstStream);
+
+    const secondStream = createWebSocketStream("ws://agent.example/acp", {
+      WebSocket,
+      cookieStore,
+    });
+
+    try {
+      const secondSocket = fakeSocketAt(instances, 1);
+      expect(secondSocket.options).toEqual({
+        headers: undefined,
+      });
+      secondSocket.open();
+    } finally {
+      await closeStream(secondStream);
+    }
+  });
+
   it("ignores binary, malformed JSON, and non-JSON-RPC messages", async () => {
     const instances: FakeWebSocket[] = [];
     const stream = createWebSocketStream("ws://agent.example/acp", {
@@ -348,6 +458,82 @@ describe("createWebSocketStream", () => {
     }
   });
 
+  it("loads durable sessions after a WebSocket reconnect", async () => {
+    const durableSessions = new Map<string, DurableSessionState>();
+    const connectionIds: string[] = [];
+    const WebSocket = createRecordingWebSocketConstructor(connectionIds);
+    const cookieStore = new MemoryAcpCookieStore();
+    const server = await startTestServer(
+      (conn: AgentSideConnection) =>
+        new DurableSessionAgent(conn, durableSessions),
+    );
+
+    try {
+      const firstUpdates: SessionNotification[] = [];
+      const firstStream = createWebSocketStream(server.wsUrl, {
+        WebSocket,
+        cookieStore,
+      });
+      const firstConn = new ClientSideConnection(
+        () => createTestClient({ updates: firstUpdates }),
+        firstStream,
+      );
+      const initialized = await firstConn.initialize({
+        protocolVersion: PROTOCOL_VERSION,
+        clientCapabilities: {},
+      });
+      expect(initialized.agentCapabilities?.loadSession).toBe(true);
+      const session = await firstConn.newSession({
+        cwd: "/tmp",
+        mcpServers: [],
+      });
+      await expect(
+        firstConn.prompt({
+          sessionId: session.sessionId,
+          prompt: [{ type: "text", text: "Remember this" }],
+        }),
+      ).resolves.toEqual({ stopReason: "end_turn" });
+      await waitForUpdates(firstUpdates, 1);
+      await closeStream(firstStream);
+
+      expect(durableSessions.has(session.sessionId)).toBe(true);
+
+      const secondUpdates: SessionNotification[] = [];
+      const secondStream = createWebSocketStream(server.wsUrl, {
+        WebSocket,
+        cookieStore,
+      });
+      const secondConn = new ClientSideConnection(
+        () => createTestClient({ updates: secondUpdates }),
+        secondStream,
+      );
+      const reinitialized = await secondConn.initialize({
+        protocolVersion: PROTOCOL_VERSION,
+        clientCapabilities: {},
+      });
+      expect(reinitialized.agentCapabilities?.loadSession).toBe(true);
+
+      // Production agents must authorize session/load against the authenticated
+      // principal. This SDK transport test omits auth because there is no
+      // generic auth layer in the SDK.
+      await expect(
+        secondConn.loadSession({
+          sessionId: session.sessionId,
+          cwd: "/tmp",
+          mcpServers: [],
+        }),
+      ).resolves.toEqual({});
+      await waitForUpdates(secondUpdates, firstUpdates.length);
+      await closeStream(secondStream);
+
+      expect(connectionIds).toHaveLength(2);
+      expect(connectionIds[0]).not.toBe(connectionIds[1]);
+      expect(secondUpdates).toEqual(firstUpdates);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("keeps multiple sessions isolated through the SDK client abstraction", async () => {
     const updates: SessionNotification[] = [];
     const server = await startTestServer();
@@ -405,6 +591,79 @@ describe("createWebSocketStream", () => {
   });
 });
 
+interface DurableSessionState {
+  readonly cwd: string;
+  readonly history: SessionNotification[];
+}
+
+class DurableSessionAgent implements Agent {
+  constructor(
+    private readonly connection: AgentSideConnection,
+    private readonly sessions: Map<string, DurableSessionState>,
+  ) {}
+
+  initialize(_params: InitializeRequest): Promise<InitializeResponse> {
+    return Promise.resolve({
+      protocolVersion: PROTOCOL_VERSION,
+      agentCapabilities: {
+        loadSession: true,
+      },
+    });
+  }
+
+  newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    const sessionId = globalThis.crypto.randomUUID();
+    this.sessions.set(sessionId, {
+      cwd: params.cwd,
+      history: [],
+    });
+    return Promise.resolve({ sessionId });
+  }
+
+  async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    const session = this.sessions.get(params.sessionId);
+    if (!session) {
+      throw new Error(`Unknown durable session: ${params.sessionId}`);
+    }
+
+    for (const update of session.history) {
+      await this.connection.sessionUpdate(update);
+    }
+
+    return {};
+  }
+
+  async prompt(params: PromptRequest): Promise<PromptResponse> {
+    const session = this.sessions.get(params.sessionId);
+    if (!session) {
+      throw new Error(`Unknown durable session: ${params.sessionId}`);
+    }
+
+    const update: SessionNotification = {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: `durable-history:${session.cwd}`,
+        },
+      },
+    };
+    session.history.push(update);
+    await this.connection.sessionUpdate(update);
+
+    return { stopReason: "end_turn" };
+  }
+
+  cancel(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  authenticate(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
 interface TestClientState {
   readonly updates: SessionNotification[];
   readonly permissionRequests?: RequestPermissionRequest[];
@@ -443,6 +702,41 @@ async function readMessage(
   return result.value;
 }
 
+async function waitForUpdates(
+  updates: readonly SessionNotification[],
+  count: number,
+): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (updates.length < count) {
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out waiting for ${count} session updates`);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
+function createRecordingWebSocketConstructor(
+  connectionIds: string[],
+): WebSocketConstructor {
+  return class RecordingWebSocket extends WebSocket {
+    constructor(
+      url: string,
+      protocols?: string | string[],
+      options?: { headers?: Record<string, string> },
+    ) {
+      super(url, protocols, options);
+      this.once("upgrade", (message: IncomingMessage) => {
+        const connectionId =
+          message.headers[HEADER_CONNECTION_ID.toLowerCase()];
+        if (typeof connectionId === "string") {
+          connectionIds.push(connectionId);
+        }
+      });
+    }
+  } as unknown as WebSocketConstructor;
+}
+
 function createFakeWebSocketConstructor(
   instances: FakeWebSocket[],
 ): WebSocketConstructor {
@@ -469,6 +763,16 @@ function fakeSocketAt(
   }
 
   return socket;
+}
+
+function headersWithSetCookie(values: readonly string[]): Headers {
+  const headers = new Headers();
+
+  Object.defineProperty(headers, "getSetCookie", {
+    value: () => values,
+  });
+
+  return headers;
 }
 
 class FakeWebSocket {
@@ -521,6 +825,10 @@ class FakeWebSocket {
 
   receive(data: unknown, isBinary = false): void {
     this.emit("message", { data, isBinary });
+  }
+
+  upgrade(message: unknown): void {
+    this.emit("upgrade", message);
   }
 
   private emit(type: string, event: unknown): void {
