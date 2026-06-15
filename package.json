@@ -30,22 +30,22 @@
       "import": "./dist/acp.js",
       "default": "./dist/acp.js"
     },
-    "./http-client": {
+    "./experimental/http-client": {
       "types": "./dist/http-stream.d.ts",
       "import": "./dist/http-stream.js",
       "default": "./dist/http-stream.js"
     },
-    "./ws-client": {
+    "./experimental/ws-client": {
       "types": "./dist/ws-stream.d.ts",
       "import": "./dist/ws-stream.js",
       "default": "./dist/ws-stream.js"
     },
-    "./server": {
+    "./experimental/server": {
       "types": "./dist/server.d.ts",
       "import": "./dist/server.js",
       "default": "./dist/server.js"
     },
-    "./node": {
+    "./experimental/node": {
       "types": "./dist/node-adapter.d.ts",
       "import": "./dist/node-adapter.js",
       "default": "./dist/node-adapter.js"

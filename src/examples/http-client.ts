@@ -4,7 +4,7 @@ import * as acp from "@agentclientprotocol/sdk";
 import {
   MemoryAcpCookieStore,
   createHttpStream,
-} from "@agentclientprotocol/sdk/http-client";
+} from "@agentclientprotocol/sdk/experimental/http-client";
 
 class HttpExampleClient implements acp.Client {
   async requestPermission(

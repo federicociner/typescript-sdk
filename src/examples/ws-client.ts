@@ -6,8 +6,8 @@ import * as acp from "@agentclientprotocol/sdk";
 import {
   MemoryAcpCookieStore,
   createWebSocketStream,
-} from "@agentclientprotocol/sdk/ws-client";
-import type { WebSocketConstructor } from "@agentclientprotocol/sdk/ws-client";
+} from "@agentclientprotocol/sdk/experimental/ws-client";
+import type { WebSocketConstructor } from "@agentclientprotocol/sdk/experimental/ws-client";
 
 class WebSocketExampleClient implements acp.Client {
   async requestPermission(

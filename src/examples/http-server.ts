@@ -8,8 +8,8 @@ import * as acp from "@agentclientprotocol/sdk";
 import {
   createNodeHttpHandler,
   createNodeWebSocketUpgradeHandler,
-} from "@agentclientprotocol/sdk/node";
-import { AcpServer } from "@agentclientprotocol/sdk/server";
+} from "@agentclientprotocol/sdk/experimental/node";
+import { AcpServer } from "@agentclientprotocol/sdk/experimental/server";
 
 interface DurableSessionState {
   readonly cwd: string;
