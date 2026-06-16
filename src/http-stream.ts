@@ -372,26 +372,25 @@ class HttpStreamTransport {
 
     this.isClosed = true;
 
-    const connectionId = this.connectionId;
-    if (connectionId) {
-      const response = await this.fetchRequest({
-        method: "DELETE",
-        headers: {
-          [HEADER_CONNECTION_ID]: connectionId,
-        },
-      });
+    try {
+      const connectionId = this.connectionId;
+      if (connectionId) {
+        const response = await this.fetchRequest({
+          method: "DELETE",
+          headers: {
+            [HEADER_CONNECTION_ID]: connectionId,
+          },
+        });
 
-      if (!response.ok) {
-        this.abortController.abort();
-        this.clearOwnedCookieStore();
-        this.closeReadable();
-        throw await httpError("ACP DELETE failed", response);
+        if (!response.ok) {
+          throw await httpError("ACP DELETE failed", response);
+        }
       }
+    } finally {
+      this.abortController.abort();
+      this.clearOwnedCookieStore();
+      this.closeReadable();
     }
-
-    this.abortController.abort();
-    this.clearOwnedCookieStore();
-    this.closeReadable();
   }
 
   private clearOwnedCookieStore(): void {

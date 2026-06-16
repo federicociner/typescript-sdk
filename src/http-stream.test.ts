@@ -623,6 +623,34 @@ describe("createHttpStream", () => {
     }
   });
 
+  it("cleans up local resources when DELETE rejects during close", async () => {
+    const clearSpy = vi.spyOn(MemoryAcpCookieStore.prototype, "clear");
+    const controlledFetch = createControlledFetch({
+      initializeCookies: ["transport=alpha; Path=/"],
+      deleteError: new Error("Network dropped"),
+    });
+    const stream = createHttpStream("https://agent.example/acp", {
+      fetch: controlledFetch.fetch,
+    });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await writer.write(initializeRequest);
+      await readMessage(reader);
+
+      await expect(writer.close()).rejects.toThrow("Network dropped");
+      expect(sseAt(controlledFetch.sseRequests, 0).signal.aborted).toBe(true);
+      expect(clearSpy).toHaveBeenCalledTimes(1);
+      expect((await reader.read()).done).toBe(true);
+    } finally {
+      clearSpy.mockRestore();
+      reader.releaseLock();
+      writer.releaseLock();
+      await closeStream(stream);
+    }
+  });
+
   it("runs initialize, newSession, and prompt through ClientSideConnection", async () => {
     const updates: SessionNotification[] = [];
     const server = await startTestServer(
@@ -958,6 +986,7 @@ interface ControlledFetchOptions {
   readonly initializeCookies?: readonly string[];
   readonly getCookies?: readonly string[];
   readonly getStatus?: number;
+  readonly deleteError?: Error;
 }
 
 function recordInitializeConnectionIds(
@@ -1004,6 +1033,10 @@ function createControlledFetch(
           [HEADER_CONNECTION_ID]: "connection-1",
           ...setCookieResponseHeaders(options.initializeCookies),
         });
+      }
+
+      if (method === "DELETE" && options.deleteError) {
+        throw options.deleteError;
       }
 
       if (method === "POST" || method === "DELETE") {
