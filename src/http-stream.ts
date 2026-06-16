@@ -203,6 +203,7 @@ class HttpStreamTransport {
         this.pendingSessionRequests.delete(pendingSessionRequestKey);
       }
 
+      this.errorReadable(error);
       throw error;
     }
   }

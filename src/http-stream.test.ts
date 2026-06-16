@@ -58,6 +58,16 @@ const sessionNewResponse = {
   },
 } satisfies AnyMessage;
 
+const sessionNewRequest = {
+  jsonrpc: "2.0",
+  id: 1,
+  method: "session/new",
+  params: {
+    cwd: "/tmp",
+    mcpServers: [],
+  },
+} satisfies AnyMessage;
+
 const promptRequest = {
   jsonrpc: "2.0",
   id: 2,
@@ -652,6 +662,37 @@ describe("createHttpStream", () => {
     }
   });
 
+  it("errors and tears down local resources when connected POST fails", async () => {
+    const clearSpy = vi.spyOn(MemoryAcpCookieStore.prototype, "clear");
+    const controlledFetch = createControlledFetch({
+      initializeCookies: ["transport=alpha; Path=/"],
+      postStatus: 401,
+      postBody: "expired",
+    });
+    const stream = createHttpStream("https://agent.example/acp", {
+      fetch: controlledFetch.fetch,
+    });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await writer.write(initializeRequest);
+      await readMessage(reader);
+
+      await expect(writer.write(sessionNewRequest)).rejects.toThrow(
+        "ACP POST failed: 401",
+      );
+      expect(sseAt(controlledFetch.sseRequests, 0).signal.aborted).toBe(true);
+      expect(clearSpy).toHaveBeenCalledTimes(1);
+      await expect(reader.read()).rejects.toThrow("ACP POST failed");
+    } finally {
+      clearSpy.mockRestore();
+      reader.releaseLock();
+      writer.releaseLock();
+      await closeStream(stream);
+    }
+  });
+
   it("cleans up local resources when DELETE rejects during close", async () => {
     const clearSpy = vi.spyOn(MemoryAcpCookieStore.prototype, "clear");
     const controlledFetch = createControlledFetch({
@@ -1038,6 +1079,8 @@ interface ControlledFetchOptions {
   readonly initializeCookies?: readonly string[];
   readonly getCookies?: readonly string[];
   readonly getStatus?: number;
+  readonly postStatus?: number;
+  readonly postBody?: string;
   readonly deleteError?: Error;
   readonly sseResponseDelays?: ReadonlyMap<number, Promise<void>>;
 }
@@ -1090,6 +1133,16 @@ function createControlledFetch(
 
       if (method === "DELETE" && options.deleteError) {
         throw options.deleteError;
+      }
+
+      if (
+        method === "POST" &&
+        headers.has(HEADER_CONNECTION_ID) &&
+        options.postStatus !== undefined
+      ) {
+        return new Response(options.postBody ?? null, {
+          status: options.postStatus,
+        });
       }
 
       if (method === "POST" || method === "DELETE") {
