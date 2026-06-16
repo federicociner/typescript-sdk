@@ -1,11 +1,20 @@
 import { describe, expect, it } from "vitest";
 
 import { PROTOCOL_VERSION } from "./acp.js";
+import { ConnectionRegistry } from "./connection.js";
 import { HEADER_CONNECTION_ID, JSON_MIME_TYPE } from "./protocol.js";
 import { AcpServer } from "./server.js";
 import { TestAgent } from "./test-support/test-agent.js";
+import { handleWebSocketConnection } from "./ws-server.js";
 
-import type { Agent, AgentSideConnection } from "./acp.js";
+import type {
+  Agent,
+  AgentSideConnection,
+  InitializeRequest,
+  InitializeResponse,
+  NewSessionRequest,
+  NewSessionResponse,
+} from "./acp.js";
 import type { AnyMessage } from "./jsonrpc.js";
 import type { WebSocketServerSocket } from "./ws-server.js";
 
@@ -223,6 +232,111 @@ describe("AcpServer prepared WebSocket upgrades", () => {
     }
   });
 
+  it("queues WebSocket frames while initialize is pending", async () => {
+    const initialize = createDeferred<InitializeResponse>();
+    const server = new AcpServer({
+      createAgent: (conn) =>
+        new DelayedInitializeAgent(conn, initialize.promise),
+    });
+    const socket = new FakeServerSocket();
+
+    try {
+      server.prepareWebSocketUpgrade().accept(socket);
+      socket.receive(JSON.stringify(initializeRequest));
+      socket.receive(JSON.stringify(sessionNewRequest));
+
+      expect(socket.sent).toEqual([]);
+
+      initialize.resolve({
+        protocolVersion: PROTOCOL_VERSION,
+        agentCapabilities: {
+          loadSession: false,
+        },
+      });
+
+      await expect(readSentMessage(socket)).resolves.toMatchObject({
+        jsonrpc: "2.0",
+        id: initializeRequest.id,
+        result: {
+          protocolVersion: PROTOCOL_VERSION,
+        },
+      });
+      await expect(readSentMessage(socket)).resolves.toMatchObject({
+        jsonrpc: "2.0",
+        id: sessionNewRequest.id,
+        result: {
+          sessionId: "queued-session",
+        },
+      });
+    } finally {
+      socket.close();
+      await server.close();
+    }
+  });
+
+  it("clears WebSocket client-response routes after forwarding responses", async () => {
+    const registry = new ConnectionRegistry();
+    const createAgent = (conn: AgentSideConnection): Agent =>
+      new TestAgent(conn);
+    const connection = registry.createPendingConnection(createAgent);
+    const socket = new FakeServerSocket();
+
+    try {
+      handleWebSocketConnection(socket, {
+        registry,
+        createAgent,
+        connection,
+      });
+      socket.receive(JSON.stringify(initializeRequest));
+      await readSentMessage(socket);
+
+      const permission = connection.agentConnection.requestPermission({
+        sessionId: "session-1",
+        toolCall: {
+          toolCallId: "permission-tool",
+          title: "Permission tool",
+        },
+        options: [
+          {
+            kind: "allow_once",
+            name: "Allow once",
+            optionId: "allow",
+          },
+        ],
+      });
+      const permissionRequest = await readSentMessage(socket);
+      if (!("id" in permissionRequest)) {
+        throw new Error("Expected permission request ID");
+      }
+
+      expect(connection.clientResponseRoutes.size).toBe(1);
+
+      socket.receive(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: permissionRequest.id,
+          result: {
+            outcome: {
+              outcome: "selected",
+              optionId: "allow",
+            },
+          },
+        }),
+      );
+
+      await expect(permission).resolves.toEqual({
+        outcome: {
+          outcome: "selected",
+          optionId: "allow",
+        },
+      });
+      expect(connection.clientResponseRoutes.size).toBe(0);
+    } finally {
+      socket.close();
+      registry.closeAll();
+    }
+  });
+
   it("keeps existing double-settle behavior for prepared WebSocket upgrades", async () => {
     const server = new AcpServer({
       createAgent: (conn) => new TestAgent(conn),
@@ -259,6 +373,38 @@ function recordingFactory(
   };
 }
 
+class DelayedInitializeAgent extends TestAgent {
+  constructor(
+    conn: AgentSideConnection,
+    private readonly initializeResponse: Promise<InitializeResponse>,
+  ) {
+    super(conn);
+  }
+
+  initialize(_params: InitializeRequest): Promise<InitializeResponse> {
+    return this.initializeResponse;
+  }
+
+  newSession(_params: NewSessionRequest): Promise<NewSessionResponse> {
+    return Promise.resolve({ sessionId: "queued-session" });
+  }
+}
+
+function createDeferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T | PromiseLike<T>) => void;
+  readonly reject: (error: unknown) => void;
+} {
+  let resolve: (value: T | PromiseLike<T>) => void = () => {};
+  let reject: (error: unknown) => void = () => {};
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+
+  return { promise, resolve, reject };
+}
+
 function readSentMessage(socket: FakeServerSocket): Promise<AnyMessage> {
   const message = socket.sent.shift();
 
@@ -268,7 +414,8 @@ function readSentMessage(socket: FakeServerSocket): Promise<AnyMessage> {
 
   return new Promise((resolve) => {
     socket.onSend = (data) => {
-      resolve(JSON.parse(data));
+      const message = socket.sent.shift();
+      resolve(JSON.parse(message ?? data));
     };
   });
 }

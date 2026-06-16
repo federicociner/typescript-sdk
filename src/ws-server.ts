@@ -49,6 +49,7 @@ class WebSocketServerSession {
   private preparedConnection: ConnectionState | undefined;
   private outboundReader: ReadableStreamDefaultReader<AnyMessage> | undefined;
   private inboundWriteChain: Promise<void> = Promise.resolve();
+  private messageChain: Promise<void> = Promise.resolve();
   private isClosed = false;
   private readonly detachListeners: Array<() => void> = [];
 
@@ -62,7 +63,7 @@ class WebSocketServerSession {
   start(): void {
     this.detachListeners.push(
       onWebSocket(this.socket, "message", (...args) => {
-        void this.handleSocketMessage(args);
+        this.enqueueSocketMessage(args);
       }),
     );
 
@@ -77,6 +78,18 @@ class WebSocketServerSession {
         void this.shutdown(1011, "WebSocket error");
       }),
     );
+  }
+
+  private enqueueSocketMessage(args: unknown[]): void {
+    const handled = this.messageChain.then(() =>
+      this.handleSocketMessage(args),
+    );
+    this.messageChain = handled.catch((error) => {
+      if (!this.isClosed) {
+        console.error("ACP WebSocket message handling failed:", error);
+        void this.shutdown(1011, "Message handling failed");
+      }
+    });
   }
 
   private async handleSocketMessage(args: unknown[]): Promise<void> {
@@ -207,6 +220,10 @@ class WebSocketServerSession {
     }
 
     if (isResponseMessage(message)) {
+      const key = messageIdKey(message.id);
+      if (key) {
+        connection.clientResponseRoutes.delete(key);
+      }
       await this.writeInbound(message);
       return { ok: true };
     }
