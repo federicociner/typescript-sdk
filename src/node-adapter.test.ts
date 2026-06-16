@@ -126,6 +126,43 @@ describe("createNodeHttpHandler", () => {
     }
   });
 
+  it("decodes request bodies across split UTF-8 chunks", async () => {
+    const acpServer = new AcpServer({
+      createAgent: (conn: AgentSideConnection) => new TestAgent(conn),
+    });
+    const seenBodies: string[] = [];
+    const response = new CapturingServerResponse();
+    const body = JSON.stringify({ prompt: "split 🚀 path" });
+    const bodyBytes = new TextEncoder().encode(body);
+    const splitIndex = new TextEncoder().encode(
+      body.slice(0, body.indexOf("🚀")),
+    ).length;
+
+    acpServer.handleRequest = async (req) => {
+      seenBodies.push(await req.text());
+      return new Response("ok");
+    };
+
+    createNodeHttpHandler(acpServer)(
+      fakeRequest({
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        bodyChunks: [
+          bodyBytes.slice(0, splitIndex + 1),
+          bodyBytes.slice(splitIndex + 1),
+        ],
+      }),
+      response as unknown as ServerResponse,
+    );
+
+    await response.finished;
+
+    expect(response.statusCode).toBe(200);
+    expect(seenBodies).toEqual([body]);
+  });
+
   it("cancels streaming response bodies when the Node response closes while backpressured", async () => {
     const acpServer = new AcpServer({
       createAgent: (conn: AgentSideConnection) => new TestAgent(conn),
@@ -167,6 +204,39 @@ describe("createNodeHttpHandler", () => {
   });
 });
 
+class CapturingServerResponse extends EventEmitter {
+  statusCode = 200;
+  headersSent = false;
+  destroyed = false;
+  writableEnded = false;
+  readonly chunks: string[] = [];
+
+  private readonly finishDeferred = createDeferred<void>();
+  readonly finished = this.finishDeferred.promise;
+
+  setHeader(): void {}
+
+  flushHeaders(): void {
+    this.headersSent = true;
+  }
+
+  write(chunk: Uint8Array | string): boolean {
+    this.chunks.push(
+      typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"),
+    );
+    return true;
+  }
+
+  end(chunk?: Uint8Array | string): void {
+    if (chunk !== undefined) {
+      this.write(chunk);
+    }
+
+    this.writableEnded = true;
+    this.finishDeferred.resolve();
+  }
+}
+
 class BackpressuredServerResponse extends EventEmitter {
   statusCode = 200;
   headersSent = false;
@@ -199,14 +269,26 @@ class BackpressuredServerResponse extends EventEmitter {
   }
 }
 
-function fakeRequest(): IncomingMessage {
+function fakeRequest(
+  options: {
+    readonly method?: string;
+    readonly headers?: Record<string, string>;
+    readonly bodyChunks?: readonly Uint8Array[];
+  } = {},
+): IncomingMessage {
   return {
-    method: "GET",
+    method: options.method ?? "GET",
     url: "/acp",
     headers: {
       host: "127.0.0.1",
+      ...options.headers,
     },
-  } as IncomingMessage;
+    async *[Symbol.asyncIterator]() {
+      for (const chunk of options.bodyChunks ?? []) {
+        yield chunk;
+      }
+    },
+  } as unknown as IncomingMessage;
 }
 
 function createDeferred<T>(): {

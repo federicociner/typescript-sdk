@@ -110,15 +110,20 @@ function hasRequestBody(req: IncomingMessage): boolean {
 }
 
 async function readRequestBody(req: IncomingMessage): Promise<string> {
-  const chunks: string[] = [];
+  const decoder = new TextDecoder();
+  let body = "";
 
   for await (const chunk of req) {
-    chunks.push(
-      typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"),
-    );
+    if (typeof chunk === "string") {
+      body += decoder.decode();
+      body += chunk;
+      continue;
+    }
+
+    body += decoder.decode(chunk, { stream: true });
   }
 
-  return chunks.join("");
+  return body + decoder.decode();
 }
 
 function nodeRequestUrl(req: IncomingMessage): string {
