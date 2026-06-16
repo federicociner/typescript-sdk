@@ -71,5 +71,9 @@ export function messageIdKey(
     return `number:${id}`;
   }
 
+  if (id === null) {
+    return "null";
+  }
+
   return undefined;
 }

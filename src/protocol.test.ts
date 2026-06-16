@@ -100,7 +100,7 @@ describe("protocol transport helpers", () => {
   it("normalizes JSON-RPC request IDs for map keys", () => {
     expect(messageIdKey("foo")).toBe("string:foo");
     expect(messageIdKey(1)).toBe("number:1");
-    expect(messageIdKey(null)).toBeUndefined();
+    expect(messageIdKey(null)).toBe("null");
     expect(messageIdKey(undefined)).toBeUndefined();
   });
 });

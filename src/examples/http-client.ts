@@ -1,10 +1,7 @@
 #!/usr/bin/env node
 
-import * as acp from "@agentclientprotocol/sdk";
-import {
-  MemoryAcpCookieStore,
-  createHttpStream,
-} from "@agentclientprotocol/sdk/experimental/http-client";
+import * as acp from "../acp.js";
+import { MemoryAcpCookieStore, createHttpStream } from "../http-stream.js";
 
 class HttpExampleClient implements acp.Client {
   async requestPermission(

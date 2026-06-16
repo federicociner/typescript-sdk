@@ -2,12 +2,9 @@
 
 import { WebSocket } from "ws";
 
-import * as acp from "@agentclientprotocol/sdk";
-import {
-  MemoryAcpCookieStore,
-  createWebSocketStream,
-} from "@agentclientprotocol/sdk/experimental/ws-client";
-import type { WebSocketConstructor } from "@agentclientprotocol/sdk/experimental/ws-client";
+import * as acp from "../acp.js";
+import { MemoryAcpCookieStore, createWebSocketStream } from "../ws-stream.js";
+import type { WebSocketConstructor } from "../ws-stream.js";
 
 class WebSocketExampleClient implements acp.Client {
   async requestPermission(

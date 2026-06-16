@@ -39,7 +39,7 @@ const sessionNewRequest = {
   },
 };
 
-function createPromptRequest(id: number, sessionId?: string) {
+function createPromptRequest(id: string | number | null, sessionId?: string) {
   return {
     jsonrpc: "2.0",
     id,
@@ -182,6 +182,49 @@ describe("AcpServer session SSE", () => {
       expect(
         await readNextConnectionSseMessage(server.url, connectionId),
       ).toBeUndefined();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("routes null-ID session request responses to the session SSE stream", async () => {
+    const server = await startTestServer(
+      (conn: AgentSideConnection) => new TestAgent(conn, { chunkCount: 1 }),
+    );
+
+    try {
+      const connectionId = await initialize(server.url);
+      const sessionId = await createSession(server.url, connectionId);
+      const sessionSse = await openSessionSse(
+        server.url,
+        connectionId,
+        sessionId,
+      );
+
+      const accepted = await postJson(
+        server.url,
+        createPromptRequest(null, sessionId),
+        {
+          [HEADER_CONNECTION_ID]: connectionId,
+          [HEADER_SESSION_ID]: sessionId,
+        },
+      );
+
+      expect(accepted.status).toBe(202);
+      expect(await readSseMessages(sessionSse, 2)).toMatchObject([
+        {
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: { sessionId },
+        },
+        {
+          jsonrpc: "2.0",
+          id: null,
+          result: {
+            stopReason: "end_turn",
+          },
+        },
+      ]);
     } finally {
       await server.close();
     }
