@@ -2,7 +2,23 @@ import { HEADER_CONNECTION_ID } from "./protocol.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import type { AcpServer } from "./server.js";
-import type { WebSocketServer } from "ws";
+import type { WebSocketServerSocket } from "./ws-server.js";
+
+type NodeWebSocketHeadersListener = (
+  headers: string[],
+  request: IncomingMessage,
+) => void;
+
+export interface NodeWebSocketUpgradeServer {
+  on(event: "headers", listener: NodeWebSocketHeadersListener): void;
+  off(event: "headers", listener: NodeWebSocketHeadersListener): void;
+  handleUpgrade(
+    req: IncomingMessage,
+    socket: Duplex,
+    head: Buffer,
+    callback: (webSocket: WebSocketServerSocket) => void,
+  ): void;
+}
 
 export function createNodeHttpHandler(
   server: AcpServer,
@@ -14,7 +30,7 @@ export function createNodeHttpHandler(
 
 export function createNodeWebSocketUpgradeHandler(
   server: AcpServer,
-  webSocketServer: WebSocketServer,
+  webSocketServer: NodeWebSocketUpgradeServer,
 ): (req: IncomingMessage, socket: Duplex, head: Buffer) => void {
   return (req, socket, head) => {
     const upgrade = server.prepareWebSocketUpgrade();
