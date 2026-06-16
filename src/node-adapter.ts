@@ -157,9 +157,7 @@ async function writeNodeResponse(
 ): Promise<void> {
   res.statusCode = response.status;
 
-  response.headers.forEach((value, name) => {
-    res.setHeader(name, value);
-  });
+  writeNodeHeaders(res, response.headers);
 
   res.flushHeaders();
 
@@ -208,6 +206,36 @@ async function writeNodeResponse(
     await cancelReader;
     reader.releaseLock();
   }
+}
+
+function writeNodeHeaders(res: ServerResponse, headers: Headers): void {
+  const setCookieHeaders = getSetCookieHeaders(headers);
+  const fallbackSetCookieHeaders: string[] = [];
+
+  headers.forEach((value, name) => {
+    if (name.toLowerCase() === "set-cookie") {
+      if (!setCookieHeaders) {
+        fallbackSetCookieHeaders.push(value);
+      }
+
+      return;
+    }
+
+    res.setHeader(name, value);
+  });
+
+  const cookieHeaders = setCookieHeaders ?? fallbackSetCookieHeaders;
+
+  if (cookieHeaders.length > 0) {
+    res.setHeader("Set-Cookie", cookieHeaders);
+  }
+}
+
+function getSetCookieHeaders(headers: Headers): string[] | undefined {
+  const getSetCookie = headers.getSetCookie;
+  return typeof getSetCookie === "function"
+    ? getSetCookie.call(headers)
+    : undefined;
 }
 
 function writeChunk(res: ServerResponse, chunk: Uint8Array): Promise<void> {

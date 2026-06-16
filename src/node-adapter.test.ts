@@ -7,11 +7,21 @@ import { createNodeHttpHandler } from "./node-adapter.js";
 import { TestAgent } from "./test-support/test-agent.js";
 
 import type { AgentSideConnection } from "./acp.js";
-import type { IncomingMessage, ServerResponse } from "node:http";
+import type {
+  IncomingHttpHeaders,
+  IncomingMessage,
+  ServerResponse,
+} from "node:http";
 
 interface RunningServer {
   readonly url: string;
   readonly close: () => Promise<void>;
+}
+
+interface RawHttpResponse {
+  readonly statusCode: number | undefined;
+  readonly headers: IncomingHttpHeaders;
+  readonly body: string;
 }
 
 describe("createNodeHttpHandler", () => {
@@ -121,6 +131,42 @@ describe("createNodeHttpHandler", () => {
       expect(response.status).toBe(202);
       expect(response.headers.get("X-Empty-Body")).toBe("yes");
       expect(await response.text()).toBe("");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("preserves multiple Set-Cookie response headers", async () => {
+    const acpServer = new AcpServer({
+      createAgent: (conn: AgentSideConnection) => new TestAgent(conn),
+    });
+    acpServer.handleRequest = () => {
+      const headers = new Headers({
+        "X-Adapter-Test": "cookies",
+      });
+      headers.append("Set-Cookie", "transport=alpha; Path=/");
+      headers.append("Set-Cookie", "route=bravo; Path=/");
+
+      return Promise.resolve(
+        new Response("cookies", {
+          status: 200,
+          headers,
+        }),
+      );
+    };
+
+    const server = await startNodeServer(acpServer);
+
+    try {
+      const response = await rawHttpRequest(server.url);
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["x-adapter-test"]).toBe("cookies");
+      expect(response.headers["set-cookie"]).toEqual([
+        "transport=alpha; Path=/",
+        "route=bravo; Path=/",
+      ]);
+      expect(response.body).toBe("cookies");
     } finally {
       await server.close();
     }
@@ -350,4 +396,26 @@ async function startNodeServer(acpServer: AcpServer): Promise<RunningServer> {
         });
       }),
   };
+}
+
+async function rawHttpRequest(url: string): Promise<RawHttpResponse> {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, (response) => {
+      let body = "";
+
+      response.setEncoding("utf8");
+      response.on("data", (chunk: string) => {
+        body += chunk;
+      });
+      response.on("end", () => {
+        resolve({
+          statusCode: response.statusCode,
+          headers: response.headers,
+          body,
+        });
+      });
+    });
+
+    req.on("error", reject);
+  });
 }
