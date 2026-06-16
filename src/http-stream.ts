@@ -16,6 +16,12 @@ import type { AcpCookieStore } from "./cookie-store.js";
 import type { AnyMessage } from "./jsonrpc.js";
 import type { Stream } from "./stream.js";
 
+interface SseLifecycle {
+  readonly onOpen?: () => void;
+  readonly onError?: (error: unknown) => void;
+  readonly onClose?: () => void;
+}
+
 export interface HttpStreamOptions {
   /** Fetch implementation to use. Defaults to `globalThis.fetch`. */
   readonly fetch?: typeof globalThis.fetch;
@@ -65,6 +71,7 @@ class HttpStreamTransport {
   private readonly ownsCookieStore: boolean;
   private readonly abortController = new AbortController();
   private readonly knownSessions = new Set<string>();
+  private readonly sessionSseReady = new Map<string, Promise<void>>();
   private readonly pendingResponseSessions = new Map<string, string>();
   private readonly pendingSessionRequests = new Map<string, string>();
 
@@ -160,7 +167,7 @@ class HttpStreamTransport {
 
     const sessionId = this.sessionIdForOutboundMessage(message);
     if (sessionId) {
-      this.openSessionSse(sessionId);
+      await this.openSessionSse(sessionId);
     }
 
     const pendingSessionRequestKey =
@@ -227,25 +234,73 @@ class HttpStreamTransport {
     });
   }
 
-  private openSessionSse(sessionId: string): void {
+  private openSessionSse(sessionId: string): Promise<void> {
+    const existingReady = this.sessionSseReady.get(sessionId);
+    if (existingReady) {
+      return existingReady;
+    }
+
     if (this.knownSessions.has(sessionId)) {
-      return;
+      return Promise.resolve();
     }
 
     const connectionId = this.connectionId;
     if (!connectionId) {
-      return;
+      return Promise.resolve();
     }
 
-    this.knownSessions.add(sessionId);
-
-    void this.openSse({
-      [HEADER_CONNECTION_ID]: connectionId,
-      [HEADER_SESSION_ID]: sessionId,
+    let isReadySettled = false;
+    let resolveReady: () => void = () => {};
+    let rejectReady: (error: unknown) => void = () => {};
+    const ready = new Promise<void>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
     });
+    const settleReady = (callback: () => void): void => {
+      if (isReadySettled) {
+        return;
+      }
+
+      isReadySettled = true;
+      callback();
+    };
+
+    ready.catch(() => undefined);
+    this.knownSessions.add(sessionId);
+    this.sessionSseReady.set(sessionId, ready);
+
+    void this.openSse(
+      {
+        [HEADER_CONNECTION_ID]: connectionId,
+        [HEADER_SESSION_ID]: sessionId,
+      },
+      {
+        onOpen: () => {
+          settleReady(resolveReady);
+        },
+        onError: (error) => {
+          settleReady(() => {
+            rejectReady(error);
+          });
+        },
+        onClose: () => {
+          this.sessionSseReady.delete(sessionId);
+          settleReady(() => {
+            rejectReady(
+              new Error("ACP session SSE stream closed before opening"),
+            );
+          });
+        },
+      },
+    );
+
+    return ready;
   }
 
-  private async openSse(headers: Record<string, string>): Promise<void> {
+  private async openSse(
+    headers: Record<string, string>,
+    lifecycle: SseLifecycle = {},
+  ): Promise<void> {
     const streamSessionId = headers[HEADER_SESSION_ID];
 
     try {
@@ -266,6 +321,8 @@ class HttpStreamTransport {
         throw new Error("ACP SSE response missing body");
       }
 
+      lifecycle.onOpen?.();
+
       for await (const message of parseSseStream(response.body)) {
         if (this.isClosed) {
           return;
@@ -273,7 +330,7 @@ class HttpStreamTransport {
 
         const sessionId = sessionIdFromResponseResult(message);
         if (sessionId) {
-          this.openSessionSse(sessionId);
+          void this.openSessionSse(sessionId);
         }
 
         this.trackServerRequestRoute(message, headers[HEADER_SESSION_ID]);
@@ -287,7 +344,10 @@ class HttpStreamTransport {
         return;
       }
 
+      lifecycle.onError?.(error);
       this.errorReadable(error);
+    } finally {
+      lifecycle.onClose?.();
     }
   }
 
@@ -302,6 +362,7 @@ class HttpStreamTransport {
     }
 
     this.knownSessions.delete(streamSessionId);
+    this.sessionSseReady.delete(streamSessionId);
 
     if (this.hasPendingSessionRequest(streamSessionId)) {
       this.errorReadable(new Error("ACP session SSE stream closed"));

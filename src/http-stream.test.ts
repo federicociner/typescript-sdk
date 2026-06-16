@@ -218,8 +218,11 @@ describe("createHttpStream", () => {
     }
   });
 
-  it("reopens session SSE after it closes cleanly without pending requests", async () => {
-    const controlledFetch = createControlledFetch();
+  it("waits for a reopened session SSE before posting session-scoped messages", async () => {
+    const reopenedSessionSseResponse = createDeferred<void>();
+    const controlledFetch = createControlledFetch({
+      sseResponseDelays: new Map([[2, reopenedSessionSseResponse.promise]]),
+    });
     const stream = createHttpStream("https://agent.example/acp", {
       fetch: controlledFetch.fetch,
     });
@@ -233,11 +236,10 @@ describe("createHttpStream", () => {
       await readMessage(reader);
       await controlledFetch.closeSse(1);
       await flushMicrotasks();
-      await writer.write(promptRequest);
+      const promptWrite = writer.write(promptRequest);
+      await flushMicrotasks();
 
       const reopenedSessionGet = requestAt(controlledFetch.requests, 3);
-      const promptPost = requestAt(controlledFetch.requests, 4);
-
       expect(reopenedSessionGet.method).toBe("GET");
       expect(reopenedSessionGet.headers.get(HEADER_CONNECTION_ID)).toBe(
         "connection-1",
@@ -245,6 +247,12 @@ describe("createHttpStream", () => {
       expect(reopenedSessionGet.headers.get(HEADER_SESSION_ID)).toBe(
         "session-1",
       );
+      expect(controlledFetch.requests).toHaveLength(4);
+
+      reopenedSessionSseResponse.resolve();
+      await promptWrite;
+
+      const promptPost = requestAt(controlledFetch.requests, 4);
       expect(promptPost.method).toBe("POST");
       expect(promptPost.headers.get(HEADER_SESSION_ID)).toBe("session-1");
     } finally {
@@ -1008,6 +1016,7 @@ interface ControlledFetchOptions {
   readonly getCookies?: readonly string[];
   readonly getStatus?: number;
   readonly deleteError?: Error;
+  readonly sseResponseDelays?: ReadonlyMap<number, Promise<void>>;
 }
 
 function recordInitializeConnectionIds(
@@ -1073,6 +1082,9 @@ function createControlledFetch(
           });
         }
 
+        const sseIndex = sseRequests.length;
+        await options.sseResponseDelays?.get(sseIndex);
+
         const stream = new TransformStream<Uint8Array, Uint8Array>();
         const writer = stream.writable.getWriter();
         const signal = init?.signal;
@@ -1137,6 +1149,21 @@ async function closeStream(stream: {
 async function flushMicrotasks(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
+}
+
+function createDeferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T | PromiseLike<T>) => void;
+  readonly reject: (error: unknown) => void;
+} {
+  let resolve: (value: T | PromiseLike<T>) => void = () => {};
+  let reject: (error: unknown) => void = () => {};
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+
+  return { promise, resolve, reject };
 }
 
 async function readMessage(
