@@ -188,6 +188,91 @@ describe("createHttpStream", () => {
     }
   });
 
+  it("errors the stream when the connection SSE closes cleanly", async () => {
+    const controlledFetch = createControlledFetch();
+    const stream = createHttpStream("https://agent.example/acp", {
+      fetch: controlledFetch.fetch,
+    });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await writer.write(initializeRequest);
+      await readMessage(reader);
+      await controlledFetch.closeSse(0);
+
+      await expect(reader.read()).rejects.toThrow(
+        "ACP connection SSE stream closed",
+      );
+    } finally {
+      reader.releaseLock();
+      writer.releaseLock();
+      await closeStream(stream);
+    }
+  });
+
+  it("reopens session SSE after it closes cleanly without pending requests", async () => {
+    const controlledFetch = createControlledFetch();
+    const stream = createHttpStream("https://agent.example/acp", {
+      fetch: controlledFetch.fetch,
+    });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await writer.write(initializeRequest);
+      await readMessage(reader);
+      await controlledFetch.sendSse(0, sessionNewResponse);
+      await readMessage(reader);
+      await controlledFetch.closeSse(1);
+      await flushMicrotasks();
+      await writer.write(promptRequest);
+
+      const reopenedSessionGet = requestAt(controlledFetch.requests, 3);
+      const promptPost = requestAt(controlledFetch.requests, 4);
+
+      expect(reopenedSessionGet.method).toBe("GET");
+      expect(reopenedSessionGet.headers.get(HEADER_CONNECTION_ID)).toBe(
+        "connection-1",
+      );
+      expect(reopenedSessionGet.headers.get(HEADER_SESSION_ID)).toBe(
+        "session-1",
+      );
+      expect(promptPost.method).toBe("POST");
+      expect(promptPost.headers.get(HEADER_SESSION_ID)).toBe("session-1");
+    } finally {
+      reader.releaseLock();
+      writer.releaseLock();
+      await closeStream(stream);
+    }
+  });
+
+  it("errors the stream when a session SSE closes with a pending request", async () => {
+    const controlledFetch = createControlledFetch();
+    const stream = createHttpStream("https://agent.example/acp", {
+      fetch: controlledFetch.fetch,
+    });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await writer.write(initializeRequest);
+      await readMessage(reader);
+      await controlledFetch.sendSse(0, sessionNewResponse);
+      await readMessage(reader);
+      await writer.write(promptRequest);
+      await controlledFetch.closeSse(1);
+
+      await expect(reader.read()).rejects.toThrow(
+        "ACP session SSE stream closed",
+      );
+    } finally {
+      reader.releaseLock();
+      writer.releaseLock();
+      await closeStream(stream);
+    }
+  });
+
   it("opens session SSE before posting session/load for an existing session", async () => {
     const controlledFetch = createControlledFetch();
     const stream = createHttpStream("https://agent.example/acp", {
@@ -861,6 +946,7 @@ interface ControlledFetch {
   readonly requests: RecordedRequest[];
   readonly sseRequests: RecordedSseRequest[];
   readonly sendSse: (index: number, message: AnyMessage) => Promise<void>;
+  readonly closeSse: (index: number) => Promise<void>;
 }
 
 interface TestClientState {
@@ -939,7 +1025,7 @@ function createControlledFetch(
 
         if (signal) {
           signal.addEventListener("abort", () => {
-            void writer.close();
+            void writer.close().catch(() => undefined);
           });
         }
 
@@ -963,6 +1049,9 @@ function createControlledFetch(
       await sseAt(sseRequests, index).writer.write(
         encoder.encode(serializeSseEvent(message)),
       );
+    },
+    closeSse: async (index) => {
+      await sseAt(sseRequests, index).writer.close();
     },
   };
 }
@@ -989,6 +1078,11 @@ async function closeStream(stream: {
   writable: WritableStream<AnyMessage>;
 }): Promise<void> {
   await stream.writable.close().catch(() => undefined);
+}
+
+async function flushMicrotasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 async function readMessage(

@@ -1,4 +1,4 @@
-import { isJsonRpcMessage } from "./jsonrpc.js";
+import { isJsonRpcMessage, isResponseMessage } from "./jsonrpc.js";
 import {
   EVENT_STREAM_MIME_TYPE,
   HEADER_CONNECTION_ID,
@@ -66,6 +66,7 @@ class HttpStreamTransport {
   private readonly abortController = new AbortController();
   private readonly knownSessions = new Set<string>();
   private readonly pendingResponseSessions = new Map<string, string>();
+  private readonly pendingSessionRequests = new Map<string, string>();
 
   private readableController:
     | ReadableStreamDefaultController<AnyMessage>
@@ -162,18 +163,35 @@ class HttpStreamTransport {
       this.openSessionSse(sessionId);
     }
 
-    const response = await this.fetchRequest({
-      method: "POST",
-      headers: {
-        "Content-Type": JSON_MIME_TYPE,
-        [HEADER_CONNECTION_ID]: connectionId,
-        ...(sessionId ? { [HEADER_SESSION_ID]: sessionId } : {}),
-      },
-      body: JSON.stringify(message),
-    });
+    const pendingSessionRequestKey =
+      sessionId && "method" in message && "id" in message
+        ? messageIdKey(message.id)
+        : undefined;
 
-    if (!response.ok) {
-      throw await httpError("ACP POST failed", response);
+    if (sessionId && pendingSessionRequestKey) {
+      this.pendingSessionRequests.set(pendingSessionRequestKey, sessionId);
+    }
+
+    try {
+      const response = await this.fetchRequest({
+        method: "POST",
+        headers: {
+          "Content-Type": JSON_MIME_TYPE,
+          [HEADER_CONNECTION_ID]: connectionId,
+          ...(sessionId ? { [HEADER_SESSION_ID]: sessionId } : {}),
+        },
+        body: JSON.stringify(message),
+      });
+
+      if (!response.ok) {
+        throw await httpError("ACP POST failed", response);
+      }
+    } catch (error) {
+      if (pendingSessionRequestKey) {
+        this.pendingSessionRequests.delete(pendingSessionRequestKey);
+      }
+
+      throw error;
     }
   }
 
@@ -221,6 +239,8 @@ class HttpStreamTransport {
   }
 
   private async openSse(headers: Record<string, string>): Promise<void> {
+    const streamSessionId = headers[HEADER_SESSION_ID];
+
     try {
       const response = await this.fetchRequest({
         method: "GET",
@@ -250,14 +270,34 @@ class HttpStreamTransport {
         }
 
         this.trackServerRequestRoute(message, headers[HEADER_SESSION_ID]);
+        this.trackInboundResponse(message);
         this.enqueue(message);
       }
+
+      this.handleSseEof(streamSessionId);
     } catch (error) {
       if (this.isClosed || this.abortController.signal.aborted) {
         return;
       }
 
       this.errorReadable(error);
+    }
+  }
+
+  private handleSseEof(streamSessionId: string | undefined): void {
+    if (this.isClosed || this.abortController.signal.aborted) {
+      return;
+    }
+
+    if (!streamSessionId) {
+      this.errorReadable(new Error("ACP connection SSE stream closed"));
+      return;
+    }
+
+    this.knownSessions.delete(streamSessionId);
+
+    if (this.hasPendingSessionRequest(streamSessionId)) {
+      this.errorReadable(new Error("ACP session SSE stream closed"));
     }
   }
 
@@ -273,6 +313,27 @@ class HttpStreamTransport {
     if (key) {
       this.pendingResponseSessions.set(key, streamSessionId);
     }
+  }
+
+  private trackInboundResponse(message: AnyMessage): void {
+    if (!isResponseMessage(message)) {
+      return;
+    }
+
+    const key = messageIdKey(message.id);
+    if (key) {
+      this.pendingSessionRequests.delete(key);
+    }
+  }
+
+  private hasPendingSessionRequest(sessionId: string): boolean {
+    for (const pendingSessionId of this.pendingSessionRequests.values()) {
+      if (pendingSessionId === sessionId) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   private async fetchRequest(init: RequestInit): Promise<Response> {
