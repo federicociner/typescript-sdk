@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
 
 import { ClientSideConnection, PROTOCOL_VERSION } from "./acp.js";
@@ -301,6 +301,7 @@ describe("createWebSocketStream", () => {
   });
 
   it("ignores binary, malformed JSON, and non-JSON-RPC messages", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const instances: FakeWebSocket[] = [];
     const stream = createWebSocketStream("ws://agent.example/acp", {
       WebSocket: createFakeWebSocketConstructor(instances),
@@ -322,8 +323,10 @@ describe("createWebSocketStream", () => {
       socket.receive(JSON.stringify(initializeResponse));
 
       expect(await readMessage(reader)).toEqual(initializeResponse);
+      expect(warn).toHaveBeenCalledTimes(2);
     } finally {
       reader.releaseLock();
+      warn.mockRestore();
       await closeStream(stream);
     }
   });

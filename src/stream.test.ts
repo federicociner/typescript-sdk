@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { ndJsonStream } from "./stream.js";
 import type { AnyMessage } from "./jsonrpc.js";
 
@@ -131,6 +131,9 @@ describe("ndJsonStream", () => {
   });
 
   it("skips malformed lines and continues parsing", async () => {
+    const error = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
     const msg1 = { jsonrpc: "2.0" as const, id: 1, method: "before" };
     const msg2 = { jsonrpc: "2.0" as const, id: 2, method: "after" };
     const input = readableFromChunks([
@@ -147,5 +150,8 @@ describe("ndJsonStream", () => {
     const messages = await collectMessages(readable);
 
     expect(messages).toEqual([msg1, msg2]);
+    expect(error).toHaveBeenCalledOnce();
+
+    error.mockRestore();
   });
 });
