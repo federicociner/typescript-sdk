@@ -97,9 +97,7 @@ class HttpStreamTransport {
         start: (controller) => {
           this.readableController = controller;
         },
-        cancel: () => {
-          void this.close();
-        },
+        cancel: () => this.close(),
       }),
       writable: new WritableStream<AnyMessage>({
         write: (message) => {

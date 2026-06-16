@@ -680,6 +680,29 @@ describe("createHttpStream", () => {
     }
   });
 
+  it("propagates DELETE failures from readable cancel", async () => {
+    const controlledFetch = createControlledFetch({
+      deleteError: new Error("Network dropped"),
+    });
+    const stream = createHttpStream("https://agent.example/acp", {
+      fetch: controlledFetch.fetch,
+    });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await writer.write(initializeRequest);
+      await readMessage(reader);
+
+      await expect(reader.cancel()).rejects.toThrow("Network dropped");
+      expect(sseAt(controlledFetch.sseRequests, 0).signal.aborted).toBe(true);
+    } finally {
+      reader.releaseLock();
+      writer.releaseLock();
+      await closeStream(stream);
+    }
+  });
+
   it("runs initialize, newSession, and prompt through ClientSideConnection", async () => {
     const updates: SessionNotification[] = [];
     const server = await startTestServer(
