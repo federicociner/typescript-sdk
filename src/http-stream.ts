@@ -186,6 +186,13 @@ class HttpStreamTransport {
       if (!response.ok) {
         throw await httpError("ACP POST failed", response);
       }
+
+      if (!("method" in message) && "id" in message) {
+        const key = messageIdKey(message.id);
+        if (key) {
+          this.pendingResponseSessions.delete(key);
+        }
+      }
     } catch (error) {
       if (pendingSessionRequestKey) {
         this.pendingSessionRequests.delete(pendingSessionRequestKey);

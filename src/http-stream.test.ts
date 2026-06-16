@@ -110,6 +110,13 @@ const permissionResponse = {
   },
 } satisfies AnyMessage;
 
+const connectionScopedServerRequest = {
+  jsonrpc: "2.0",
+  id: 99,
+  method: "connection/example",
+  params: {},
+} satisfies AnyMessage;
+
 describe("createHttpStream", () => {
   it("posts initialize with custom headers, opens connection SSE, and emits the initialize response", async () => {
     const controlledFetch = createControlledFetch();
@@ -304,7 +311,7 @@ describe("createHttpStream", () => {
     }
   });
 
-  it("includes the session header on responses to session-scoped server requests", async () => {
+  it("includes the session header only on responses to session-scoped server requests", async () => {
     const controlledFetch = createControlledFetch();
     const stream = createHttpStream("https://agent.example/acp", {
       fetch: controlledFetch.fetch,
@@ -328,6 +335,20 @@ describe("createHttpStream", () => {
       );
       expect(responsePost.headers.get(HEADER_SESSION_ID)).toBe("session-1");
       expect(JSON.parse(responsePost.body)).toEqual(permissionResponse);
+
+      await controlledFetch.sendSse(0, connectionScopedServerRequest);
+      await readMessage(reader);
+      await writer.write(permissionResponse);
+
+      const connectionResponsePost = requestAt(controlledFetch.requests, 4);
+      expect(connectionResponsePost.method).toBe("POST");
+      expect(connectionResponsePost.headers.get(HEADER_CONNECTION_ID)).toBe(
+        "connection-1",
+      );
+      expect(connectionResponsePost.headers.get(HEADER_SESSION_ID)).toBeNull();
+      expect(JSON.parse(connectionResponsePost.body)).toEqual(
+        permissionResponse,
+      );
     } finally {
       reader.releaseLock();
       writer.releaseLock();
