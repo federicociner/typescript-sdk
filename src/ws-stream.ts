@@ -97,6 +97,7 @@ class WebSocketStreamTransport {
       this.resolveOpen = resolve;
       this.rejectOpen = reject;
     });
+    this.openPromise.catch(() => undefined);
 
     this.detachListeners.push(
       onWebSocket(this.socket, "open", () => {

@@ -199,6 +199,31 @@ describe("createWebSocketStream", () => {
     }
   });
 
+  it("does not emit unhandled rejections when the socket closes before the first write", async () => {
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    const instances: FakeWebSocket[] = [];
+    const stream = createWebSocketStream("ws://agent.example/acp", {
+      WebSocket: createFakeWebSocketConstructor(instances),
+    });
+    const reader = stream.readable.getReader();
+
+    try {
+      fakeSocketAt(instances, 0).close();
+
+      expect(await reader.read()).toEqual({ done: true, value: undefined });
+      await waitForUnhandledRejections();
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+      reader.releaseLock();
+      await closeStream(stream);
+    }
+  });
+
   it("passes managed cookies and custom headers to custom WebSocket constructors", async () => {
     const cookieStore = new MemoryAcpCookieStore();
     cookieStore.store(headersWithSetCookie(["transport=alpha", "route=bravo"]));
@@ -717,6 +742,10 @@ async function waitForUpdates(
 
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
+}
+
+async function waitForUnhandledRejections(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function createRecordingWebSocketConstructor(
