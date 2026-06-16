@@ -141,7 +141,7 @@ class WebSocketServerSession {
 
     const connection =
       this.preparedConnection ??
-      this.options.registry.createConnection(this.options.createAgent);
+      this.options.registry.createPendingConnection(this.options.createAgent);
     this.preparedConnection = connection;
 
     try {
@@ -150,19 +150,20 @@ class WebSocketServerSession {
       const initialResponse = await connection.recvInitial(message.id);
 
       if (this.isClosed) {
-        this.options.registry.remove(connection.connectionId);
+        this.options.registry.discard(connection.connectionId);
         return;
       }
 
       this.preparedConnection = undefined;
       this.connection = connection;
+      this.options.registry.register(connection);
       connection.startRouter();
 
       this.send(initialResponse);
       this.startOutboundPump(connection);
     } catch (error) {
       this.preparedConnection = undefined;
-      this.options.registry.remove(connection.connectionId);
+      this.options.registry.discard(connection.connectionId);
 
       this.send({
         jsonrpc: "2.0",
@@ -328,12 +329,12 @@ class WebSocketServerSession {
     }
 
     if (this.connection) {
-      this.options.registry.remove(this.connection.connectionId);
+      this.options.registry.discard(this.connection.connectionId);
       this.connection = undefined;
     }
 
     if (this.preparedConnection) {
-      this.options.registry.remove(this.preparedConnection.connectionId);
+      this.options.registry.discard(this.preparedConnection.connectionId);
       this.preparedConnection = undefined;
     }
   }

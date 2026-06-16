@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { PROTOCOL_VERSION } from "./acp.js";
-import { HEADER_CONNECTION_ID } from "./protocol.js";
+import { HEADER_CONNECTION_ID, JSON_MIME_TYPE } from "./protocol.js";
 import { AcpServer } from "./server.js";
 import { TestAgent } from "./test-support/test-agent.js";
 
@@ -16,6 +16,16 @@ const initializeRequest = {
   params: {
     protocolVersion: PROTOCOL_VERSION,
     clientCapabilities: {},
+  },
+} satisfies AnyMessage;
+
+const sessionNewRequest = {
+  jsonrpc: "2.0",
+  id: 1,
+  method: "session/new",
+  params: {
+    cwd: "/tmp",
+    mcpServers: [],
   },
 } satisfies AnyMessage;
 
@@ -153,6 +163,62 @@ describe("AcpServer prepared WebSocket upgrades", () => {
 
       expect(response.status).toBe(404);
     } finally {
+      await server.close();
+    }
+  });
+
+  it("does not expose accepted WebSocket upgrades to HTTP before initialize succeeds", async () => {
+    const server = new AcpServer({
+      createAgent: (conn) => new TestAgent(conn),
+    });
+    const prepared = server.prepareWebSocketUpgrade();
+    const socket = new FakeServerSocket();
+
+    try {
+      prepared.accept(socket);
+
+      const getResponse = await server.handleRequest(
+        new Request("http://127.0.0.1/acp", {
+          method: "GET",
+          headers: {
+            Accept: "text/event-stream",
+            [HEADER_CONNECTION_ID]: prepared.connectionId,
+          },
+        }),
+      );
+      const postResponse = await server.handleRequest(
+        new Request("http://127.0.0.1/acp", {
+          method: "POST",
+          headers: {
+            "Content-Type": JSON_MIME_TYPE,
+            [HEADER_CONNECTION_ID]: prepared.connectionId,
+          },
+          body: JSON.stringify(sessionNewRequest),
+        }),
+      );
+      const deleteResponse = await server.handleRequest(
+        new Request("http://127.0.0.1/acp", {
+          method: "DELETE",
+          headers: {
+            [HEADER_CONNECTION_ID]: prepared.connectionId,
+          },
+        }),
+      );
+
+      expect(getResponse.status).toBe(404);
+      expect(postResponse.status).toBe(404);
+      expect(deleteResponse.status).toBe(404);
+
+      socket.receive(JSON.stringify(initializeRequest));
+      await expect(readSentMessage(socket)).resolves.toMatchObject({
+        jsonrpc: "2.0",
+        id: initializeRequest.id,
+        result: {
+          protocolVersion: PROTOCOL_VERSION,
+        },
+      });
+    } finally {
+      socket.close();
       await server.close();
     }
   });

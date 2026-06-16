@@ -90,7 +90,7 @@ export class AcpServer {
     options: PrepareWebSocketUpgradeOptions = {},
   ): PreparedWebSocketUpgrade {
     const createAgent = options.createAgent ?? this.createAgent;
-    const connection = this.registry.createConnection(createAgent);
+    const connection = this.registry.createPendingConnection(createAgent);
     let isSettled = false;
 
     return {
@@ -113,7 +113,7 @@ export class AcpServer {
         }
 
         isSettled = true;
-        this.registry.remove(connection.connectionId);
+        this.registry.discard(connection.connectionId);
       },
     };
   }

@@ -287,6 +287,7 @@ export class ConnectionState {
 
 export class ConnectionRegistry {
   private readonly connections = new Map<string, ConnectionState>();
+  private readonly pendingConnections = new Map<string, ConnectionState>();
 
   createConnection(
     agentFactory: (conn: AgentSideConnection) => Agent,
@@ -294,6 +295,19 @@ export class ConnectionRegistry {
     const connection = new ConnectionState(agentFactory);
     this.connections.set(connection.connectionId, connection);
     return connection;
+  }
+
+  createPendingConnection(
+    agentFactory: (conn: AgentSideConnection) => Agent,
+  ): ConnectionState {
+    const connection = new ConnectionState(agentFactory);
+    this.pendingConnections.set(connection.connectionId, connection);
+    return connection;
+  }
+
+  register(connection: ConnectionState): void {
+    this.pendingConnections.delete(connection.connectionId);
+    this.connections.set(connection.connectionId, connection);
   }
 
   get(connectionId: string): ConnectionState | undefined {
@@ -312,12 +326,32 @@ export class ConnectionRegistry {
     return connection;
   }
 
+  discard(connectionId: string): ConnectionState | undefined {
+    const connection =
+      this.connections.get(connectionId) ??
+      this.pendingConnections.get(connectionId);
+
+    if (!connection) {
+      return undefined;
+    }
+
+    this.connections.delete(connectionId);
+    this.pendingConnections.delete(connectionId);
+    void connection.shutdown();
+    return connection;
+  }
+
   closeAll(): void {
     for (const connection of this.connections.values()) {
       void connection.shutdown();
     }
 
+    for (const connection of this.pendingConnections.values()) {
+      void connection.shutdown();
+    }
+
     this.connections.clear();
+    this.pendingConnections.clear();
   }
 }
 
