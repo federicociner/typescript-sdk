@@ -3,7 +3,10 @@ import { EventEmitter } from "node:events";
 
 import { describe, expect, it } from "vitest";
 import { AcpServer } from "./server.js";
-import { createNodeHttpHandler } from "./node-adapter.js";
+import {
+  createNodeHttpHandler,
+  createNodeWebSocketUpgradeHandler,
+} from "./node-adapter.js";
 import { TestAgent } from "./test-support/test-agent.js";
 
 import type { AgentSideConnection } from "./acp.js";
@@ -12,6 +15,9 @@ import type {
   IncomingMessage,
   ServerResponse,
 } from "node:http";
+import type { Duplex } from "node:stream";
+import type { NodeWebSocketUpgradeServer } from "./node-adapter.js";
+import type { WebSocketServerSocket } from "./ws-server.js";
 
 interface RunningServer {
   readonly url: string;
@@ -249,6 +255,70 @@ describe("createNodeHttpHandler", () => {
     expect(response.ended).toBe(false);
   });
 });
+
+describe("createNodeWebSocketUpgradeHandler", () => {
+  it("destroys the upgrade socket when WebSocket preparation throws", async () => {
+    const error = new Error("factory failed");
+    const acpServer = new AcpServer({
+      createAgent: () => {
+        throw error;
+      },
+    });
+    const webSocketServer = new FakeNodeWebSocketUpgradeServer();
+    const socket = new FakeUpgradeSocket();
+    const handler = createNodeWebSocketUpgradeHandler(
+      acpServer,
+      webSocketServer,
+    );
+
+    try {
+      expect(() =>
+        handler(fakeRequest(), socket as unknown as Duplex, Buffer.alloc(0)),
+      ).not.toThrow();
+
+      expect(webSocketServer.handleUpgradeCalls).toBe(0);
+      expect(socket.destroyed).toBe(true);
+      expect(socket.destroyError).toBe(error);
+    } finally {
+      await acpServer.close();
+    }
+  });
+});
+
+class FakeNodeWebSocketUpgradeServer implements NodeWebSocketUpgradeServer {
+  handleUpgradeCalls = 0;
+
+  on(
+    _event: "headers",
+    _listener: (headers: string[], request: IncomingMessage) => void,
+  ): void {}
+
+  off(
+    _event: "headers",
+    _listener: (headers: string[], request: IncomingMessage) => void,
+  ): void {}
+
+  handleUpgrade(
+    _req: IncomingMessage,
+    _socket: Duplex,
+    _head: Buffer,
+    _callback: (webSocket: WebSocketServerSocket) => void,
+  ): void {
+    this.handleUpgradeCalls += 1;
+  }
+}
+
+class FakeUpgradeSocket extends EventEmitter {
+  destroyed = false;
+  destroyError: Error | undefined;
+
+  destroy(error?: Error): this {
+    this.destroyed = true;
+    this.destroyError = error;
+    this.emit("close");
+    return this;
+  }
+}
 
 class CapturingServerResponse extends EventEmitter {
   statusCode = 200;

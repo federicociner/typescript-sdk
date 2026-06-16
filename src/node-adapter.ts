@@ -1,7 +1,7 @@
 import { HEADER_CONNECTION_ID } from "./protocol.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
-import type { AcpServer } from "./server.js";
+import type { AcpServer, PreparedWebSocketUpgrade } from "./server.js";
 import type { WebSocketServerSocket } from "./ws-server.js";
 
 type NodeWebSocketHeadersListener = (
@@ -33,7 +33,7 @@ export function createNodeWebSocketUpgradeHandler(
   webSocketServer: NodeWebSocketUpgradeServer,
 ): (req: IncomingMessage, socket: Duplex, head: Buffer) => void {
   return (req, socket, head) => {
-    const upgrade = server.prepareWebSocketUpgrade();
+    let upgrade: PreparedWebSocketUpgrade | undefined;
     let hasAccepted = false;
 
     const cleanup = (): void => {
@@ -43,7 +43,7 @@ export function createNodeWebSocketUpgradeHandler(
     };
 
     const onHeaders = (headers: string[], request: IncomingMessage): void => {
-      if (request !== req) {
+      if (request !== req || !upgrade) {
         return;
       }
 
@@ -56,23 +56,24 @@ export function createNodeWebSocketUpgradeHandler(
       }
 
       cleanup();
-      upgrade.reject();
+      upgrade?.reject();
     };
 
-    webSocketServer.on("headers", onHeaders);
-    socket.once("close", onUpgradeFailed);
-    socket.once("error", onUpgradeFailed);
-
     try {
+      upgrade = server.prepareWebSocketUpgrade();
+      webSocketServer.on("headers", onHeaders);
+      socket.once("close", onUpgradeFailed);
+      socket.once("error", onUpgradeFailed);
+
       webSocketServer.handleUpgrade(req, socket, head, (webSocket) => {
         hasAccepted = true;
         cleanup();
-        upgrade.accept(webSocket);
+        upgrade?.accept(webSocket);
       });
     } catch (error) {
       cleanup();
-      upgrade.reject();
-      throw error;
+      upgrade?.reject();
+      destroyUpgradeSocket(socket, error);
     }
   };
 }
@@ -95,6 +96,10 @@ async function handleNodeRequest(
 
     res.end(error instanceof Error ? error.message : "Internal Server Error");
   }
+}
+
+function destroyUpgradeSocket(socket: Duplex, error: unknown): void {
+  socket.destroy(error instanceof Error ? error : undefined);
 }
 
 async function toWebRequest(req: IncomingMessage): Promise<Request> {
