@@ -166,43 +166,100 @@ async function writeNodeResponse(
   }
 
   const reader = responseBody.getReader();
+  let cancelReader: Promise<void> | undefined;
+
+  const onClose = (): void => {
+    cancelReader = reader
+      .cancel(new NodeResponseClosedError())
+      .catch(() => undefined);
+  };
+
+  res.once("close", onClose);
 
   try {
     while (true) {
       const result = await reader.read();
 
       if (result.done) {
-        res.end();
+        res.off("close", onClose);
+
+        if (!isNodeResponseClosed(res)) {
+          res.end();
+        }
+
         return;
       }
 
       await writeChunk(res, result.value);
     }
+  } catch (error) {
+    if (error instanceof NodeResponseClosedError) {
+      return;
+    }
+
+    throw error;
   } finally {
+    res.off("close", onClose);
+    await cancelReader;
     reader.releaseLock();
   }
 }
 
 function writeChunk(res: ServerResponse, chunk: Uint8Array): Promise<void> {
   return new Promise((resolve, reject) => {
-    const onError = (error: Error): void => {
+    let isSettled = false;
+
+    const settle = (callback: () => void): void => {
+      if (isSettled) {
+        return;
+      }
+
+      isSettled = true;
+      res.off("close", onClose);
       res.off("drain", onDrain);
-      reject(error);
+      res.off("error", onError);
+      callback();
+    };
+
+    const onError = (error: Error): void => {
+      settle(() => {
+        reject(error);
+      });
     };
 
     const onDrain = (): void => {
-      res.off("error", onError);
-      resolve();
+      settle(resolve);
     };
 
+    const onClose = (): void => {
+      settle(() => {
+        reject(new NodeResponseClosedError());
+      });
+    };
+
+    if (isNodeResponseClosed(res)) {
+      reject(new NodeResponseClosedError());
+      return;
+    }
+
+    res.once("close", onClose);
     res.once("error", onError);
 
     if (res.write(chunk)) {
-      res.off("error", onError);
-      resolve();
+      settle(resolve);
       return;
     }
 
     res.once("drain", onDrain);
   });
+}
+
+function isNodeResponseClosed(res: ServerResponse): boolean {
+  return res.destroyed || res.writableEnded;
+}
+
+class NodeResponseClosedError extends Error {
+  constructor() {
+    super("Node HTTP response closed");
+  }
 }

@@ -1,4 +1,5 @@
 import http from "node:http";
+import { EventEmitter } from "node:events";
 
 import { describe, expect, it } from "vitest";
 import { AcpServer } from "./server.js";
@@ -6,6 +7,7 @@ import { createNodeHttpHandler } from "./node-adapter.js";
 import { TestAgent } from "./test-support/test-agent.js";
 
 import type { AgentSideConnection } from "./acp.js";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
 interface RunningServer {
   readonly url: string;
@@ -123,7 +125,109 @@ describe("createNodeHttpHandler", () => {
       await server.close();
     }
   });
+
+  it("cancels streaming response bodies when the Node response closes while backpressured", async () => {
+    const acpServer = new AcpServer({
+      createAgent: (conn: AgentSideConnection) => new TestAgent(conn),
+    });
+    const responseCancelled = createDeferred<void>();
+    const response = new BackpressuredServerResponse();
+
+    acpServer.handleRequest = () =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("data: one\n\n"));
+            },
+            cancel() {
+              responseCancelled.resolve();
+            },
+          }),
+          {
+            status: 200,
+            headers: {
+              "Content-Type": "text/event-stream",
+            },
+          },
+        ),
+      );
+
+    createNodeHttpHandler(acpServer)(
+      fakeRequest(),
+      response as unknown as ServerResponse,
+    );
+
+    await response.wroteChunk;
+    response.close();
+    await responseCancelled.promise;
+    await flushMicrotasks();
+
+    expect(response.ended).toBe(false);
+  });
 });
+
+class BackpressuredServerResponse extends EventEmitter {
+  statusCode = 200;
+  headersSent = false;
+  destroyed = false;
+  writableEnded = false;
+  ended = false;
+
+  private readonly writeDeferred = createDeferred<void>();
+  readonly wroteChunk = this.writeDeferred.promise;
+
+  setHeader(): void {}
+
+  flushHeaders(): void {
+    this.headersSent = true;
+  }
+
+  write(): boolean {
+    this.writeDeferred.resolve();
+    return false;
+  }
+
+  end(): void {
+    this.ended = true;
+    this.writableEnded = true;
+  }
+
+  close(): void {
+    this.destroyed = true;
+    this.emit("close");
+  }
+}
+
+function fakeRequest(): IncomingMessage {
+  return {
+    method: "GET",
+    url: "/acp",
+    headers: {
+      host: "127.0.0.1",
+    },
+  } as IncomingMessage;
+}
+
+function createDeferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T | PromiseLike<T>) => void;
+  readonly reject: (error: unknown) => void;
+} {
+  let resolve: (value: T | PromiseLike<T>) => void = () => {};
+  let reject: (error: unknown) => void = () => {};
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+
+  return { promise, resolve, reject };
+}
+
+async function flushMicrotasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
 
 async function startNodeServer(acpServer: AcpServer): Promise<RunningServer> {
   const server = http.createServer(createNodeHttpHandler(acpServer));
