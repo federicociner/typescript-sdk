@@ -682,6 +682,13 @@ describe("createHttpStream", () => {
       await expect(writer.write(sessionNewRequest)).rejects.toThrow(
         "ACP POST failed: 401",
       );
+      const deleteRequest = requestAt(controlledFetch.requests, 3);
+      expect(deleteRequest.method).toBe("DELETE");
+      expect(deleteRequest.headers.get(HEADER_CONNECTION_ID)).toBe(
+        "connection-1",
+      );
+      expect(deleteRequest.headers.get("Cookie")).toBe("transport=alpha");
+      await flushMicrotasks();
       expect(sseAt(controlledFetch.sseRequests, 0).signal.aborted).toBe(true);
       expect(clearSpy).toHaveBeenCalledTimes(1);
       await expect(reader.read()).rejects.toThrow("ACP POST failed");
