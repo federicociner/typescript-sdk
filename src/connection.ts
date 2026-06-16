@@ -94,6 +94,7 @@ export class ConnectionState {
   readonly clientResponseRoutes = new Map<string, ResponseRoute>();
 
   private hasStartedRouter = false;
+  private inboundWriteChain: Promise<void> = Promise.resolve();
   private outboundReader: ReadableStreamDefaultReader<AnyMessage> | undefined;
 
   constructor(agentFactory: (conn: AgentSideConnection) => Agent) {
@@ -133,6 +134,14 @@ export class ConnectionState {
     }
   }
 
+  async writeInbound(message: AnyMessage): Promise<void> {
+    const write = this.inboundWriteChain.then(() =>
+      this.writeInboundMessage(message),
+    );
+    this.inboundWriteChain = write.catch(() => undefined);
+    await write;
+  }
+
   startRouter(): void {
     if (this.hasStartedRouter) {
       return;
@@ -170,6 +179,16 @@ export class ConnectionState {
       this.inboundTx.close(),
       this.outboundReader?.cancel() ?? this.outboundRx.cancel(),
     ]);
+  }
+
+  private async writeInboundMessage(message: AnyMessage): Promise<void> {
+    const writer = this.inboundTx.getWriter();
+
+    try {
+      await writer.write(message);
+    } finally {
+      writer.releaseLock();
+    }
   }
 
   private async runRouter(): Promise<void> {

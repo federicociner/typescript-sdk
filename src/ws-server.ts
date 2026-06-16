@@ -343,13 +343,7 @@ async function writeInbound(
   connection: ConnectionState,
   message: AnyMessage,
 ): Promise<void> {
-  const writer = connection.inboundTx.getWriter();
-
-  try {
-    await writer.write(message);
-  } finally {
-    writer.releaseLock();
-  }
+  await connection.writeInbound(message);
 }
 
 function determineWebSocketRoute(message: AnyRequest): ResponseRoute {

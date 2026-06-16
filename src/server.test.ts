@@ -203,6 +203,45 @@ describe("AcpServer", () => {
     }
   });
 
+  it("serializes concurrent POST writes for the same connection", async () => {
+    const server = new AcpServer({
+      createAgent: (conn: AgentSideConnection) => new TestAgent(conn),
+    });
+
+    try {
+      const connectionId = await initializeDirect(server);
+      const headers = { [HEADER_CONNECTION_ID]: connectionId };
+      const first = server.handleRequest(
+        jsonRequest(sessionNewRequest, headers),
+      );
+      const second = server.handleRequest(
+        jsonRequest({ ...sessionNewRequest, id: 3 }, headers),
+      );
+
+      const responses = await Promise.all([first, second]);
+
+      expect(responses.map((response) => response.status)).toEqual([202, 202]);
+
+      const sseResponse = await server.handleRequest(
+        new Request("http://127.0.0.1/acp", {
+          method: "GET",
+          headers: {
+            Accept: EVENT_STREAM_MIME_TYPE,
+            [HEADER_CONNECTION_ID]: connectionId,
+          },
+        }),
+      );
+
+      expect(sseResponse.status).toBe(200);
+      const messages = await readSseMessages(sseResponse, 2);
+      expect(
+        messages.map((message) => ("id" in message ? message.id : undefined)),
+      ).toEqual([2, 3]);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("ignores HTTP factory overrides for GET and DELETE requests", async () => {
     const createdBy: string[] = [];
     const server = new AcpServer({
@@ -737,6 +776,37 @@ async function readFirstSseMessage(response: Response): Promise<AnyMessage> {
   }
 
   return result.value;
+}
+
+async function readSseMessages(
+  response: Response,
+  count: number,
+): Promise<AnyMessage[]> {
+  if (!response.body) {
+    throw new Error("Expected SSE response body");
+  }
+
+  const iterator = parseSseStream(response.body)[Symbol.asyncIterator]();
+
+  try {
+    const messages: AnyMessage[] = [];
+
+    for (const __unused of Array.from({ length: count })) {
+      void __unused;
+      const result = await iterator.next();
+
+      if (result.done) {
+        throw new Error("Expected SSE message");
+      }
+
+      messages.push(result.value);
+    }
+
+    return messages;
+  } finally {
+    await iterator.return?.();
+    await response.body.cancel();
+  }
 }
 
 function postJson(
