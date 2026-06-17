@@ -232,6 +232,23 @@ describe("AcpServer prepared WebSocket upgrades", () => {
     }
   });
 
+  it("closes accepted WebSocket upgrades before initialize on server close", async () => {
+    const server = new AcpServer({
+      createAgent: (conn) => new TestAgent(conn),
+    });
+    const socket = new FakeServerSocket();
+
+    server.prepareWebSocketUpgrade().accept(socket);
+
+    expect(socket.closeCount).toBe(0);
+
+    await server.close();
+
+    expect(socket.closeCount).toBe(1);
+    expect(socket.closeCode).toBe(1001);
+    expect(socket.closeReason).toBe("Server shutting down");
+  });
+
   it("queues WebSocket frames while initialize is pending", async () => {
     const initialize = createDeferred<InitializeResponse>();
     const server = new AcpServer({
@@ -487,6 +504,9 @@ class FakeServerSocket implements WebSocketServerSocket {
   readonly sent: string[] = [];
   readonly listeners = new Map<string, Set<(event: unknown) => void>>();
   onSend: ((data: string) => void) | undefined;
+  closeCount = 0;
+  closeCode: number | undefined;
+  closeReason: string | undefined;
 
   send(data: string): void {
     this.sent.push(data);
@@ -494,7 +514,10 @@ class FakeServerSocket implements WebSocketServerSocket {
     this.onSend = undefined;
   }
 
-  close(_code?: number, _reason?: string): void {
+  close(code?: number, reason?: string): void {
+    this.closeCount += 1;
+    this.closeCode = code;
+    this.closeReason = reason;
     this.emit("close", {});
   }
 

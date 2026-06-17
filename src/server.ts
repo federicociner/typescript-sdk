@@ -13,7 +13,10 @@ import { isJsonRpcMessage, isResponseMessage } from "./jsonrpc.js";
 import { AGENT_METHODS } from "./schema/index.js";
 import { serializeSseEvent, serializeSseKeepAlive } from "./sse.js";
 import { handleWebSocketConnection } from "./ws-server.js";
-import type { WebSocketServerSocket } from "./ws-server.js";
+import type {
+  WebSocketServerSessionHandle,
+  WebSocketServerSocket,
+} from "./ws-server.js";
 
 import type {
   ConnectionState,
@@ -60,6 +63,7 @@ export interface PreparedWebSocketUpgrade {
 export class AcpServer {
   private readonly createAgent: AgentFactory;
   private readonly registry = new ConnectionRegistry();
+  private readonly webSocketSessions = new Set<WebSocketServerSessionHandle>();
 
   constructor(options: AcpServerOptions) {
     this.createAgent = options.createAgent;
@@ -101,10 +105,14 @@ export class AcpServer {
         }
 
         isSettled = true;
-        handleWebSocketConnection(socket, {
+        const session = handleWebSocketConnection(socket, {
           registry: this.registry,
           createAgent,
           connection,
+        });
+        this.webSocketSessions.add(session);
+        void session.closed.finally(() => {
+          this.webSocketSessions.delete(session);
         });
       },
       reject: () => {
@@ -120,7 +128,12 @@ export class AcpServer {
 
   /** Closes all active ACP connections owned by this server. */
   async close(): Promise<void> {
-    await this.registry.closeAll();
+    const closeConnections = this.registry.closeAll();
+    const closeWebSockets = Promise.all(
+      Array.from(this.webSocketSessions, (session) => session.close()),
+    );
+
+    await Promise.all([closeConnections, closeWebSockets]);
   }
 
   private async handlePost(

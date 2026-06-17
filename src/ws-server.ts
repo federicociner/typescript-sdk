@@ -36,21 +36,29 @@ export interface WebSocketConnectionOptions {
   readonly connection?: ConnectionState;
 }
 
+export interface WebSocketServerSessionHandle {
+  readonly closed: Promise<void>;
+  close(code?: number, reason?: string): Promise<void>;
+}
+
 export function handleWebSocketConnection(
   socket: WebSocketLike,
   options: WebSocketConnectionOptions,
-): void {
+): WebSocketServerSessionHandle {
   const session = new WebSocketServerSession(socket, options);
   session.start();
+  return session;
 }
 
-class WebSocketServerSession {
+class WebSocketServerSession implements WebSocketServerSessionHandle {
   private connection: ConnectionState | undefined;
   private preparedConnection: ConnectionState | undefined;
   private outboundReader: ReadableStreamDefaultReader<AnyMessage> | undefined;
   private inboundWriteChain: Promise<void> = Promise.resolve();
   private messageChain: Promise<void> = Promise.resolve();
   private isClosed = false;
+  private readonly closedPromise: Promise<void>;
+  private resolveClosed: () => void = () => {};
   private readonly detachListeners: Array<() => void> = [];
 
   constructor(
@@ -58,6 +66,13 @@ class WebSocketServerSession {
     private readonly options: WebSocketConnectionOptions,
   ) {
     this.preparedConnection = options.connection;
+    this.closedPromise = new Promise((resolve) => {
+      this.resolveClosed = resolve;
+    });
+  }
+
+  get closed(): Promise<void> {
+    return this.closedPromise;
   }
 
   start(): void {
@@ -78,6 +93,10 @@ class WebSocketServerSession {
         void this.shutdown(1011, "WebSocket error");
       }),
     );
+  }
+
+  close(code = 1001, reason = "Server shutting down"): Promise<void> {
+    return this.shutdown(code, reason);
   }
 
   private enqueueSocketMessage(args: unknown[]): void {
@@ -349,25 +368,29 @@ class WebSocketServerSession {
 
     this.isClosed = true;
 
-    for (const detach of this.detachListeners.splice(0)) {
-      detach();
-    }
+    try {
+      for (const detach of this.detachListeners.splice(0)) {
+        detach();
+      }
 
-    const outboundReader = this.outboundReader;
-    this.outboundReader = undefined;
+      const outboundReader = this.outboundReader;
+      this.outboundReader = undefined;
 
-    if (outboundReader) {
-      await outboundReader.cancel();
-    }
+      if (outboundReader) {
+        await outboundReader.cancel();
+      }
 
-    if (this.connection) {
-      this.options.registry.discard(this.connection.connectionId);
-      this.connection = undefined;
-    }
+      if (this.connection) {
+        this.options.registry.discard(this.connection.connectionId);
+        this.connection = undefined;
+      }
 
-    if (this.preparedConnection) {
-      this.options.registry.discard(this.preparedConnection.connectionId);
-      this.preparedConnection = undefined;
+      if (this.preparedConnection) {
+        this.options.registry.discard(this.preparedConnection.connectionId);
+        this.preparedConnection = undefined;
+      }
+    } finally {
+      this.resolveClosed();
     }
   }
 }
