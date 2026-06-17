@@ -202,6 +202,21 @@ class WebSocketServerSession {
       };
     }
 
+    if (isRequestMessage(message) && isInitializeRequest(message)) {
+      this.send({
+        jsonrpc: "2.0",
+        id: message.id,
+        error: {
+          code: -32600,
+          message: "Initialize not allowed on existing connection",
+        },
+      });
+      return {
+        ok: false,
+        message: "Initialize not allowed on existing connection",
+      };
+    }
+
     if (isRequestMessage(message)) {
       const route = determineWebSocketRoute(message);
 

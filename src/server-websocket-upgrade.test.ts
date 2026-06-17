@@ -274,6 +274,55 @@ describe("AcpServer prepared WebSocket upgrades", () => {
     }
   });
 
+  it("rejects duplicate WebSocket initialize requests after connection setup", async () => {
+    let initializeCalls = 0;
+    const server = new AcpServer({
+      createAgent: (conn) =>
+        new RecordingInitializeAgent(conn, () => {
+          initializeCalls += 1;
+        }),
+    });
+    const socket = new FakeServerSocket();
+
+    try {
+      server.prepareWebSocketUpgrade().accept(socket);
+      socket.receive(JSON.stringify(initializeRequest));
+
+      await expect(readSentMessage(socket)).resolves.toMatchObject({
+        jsonrpc: "2.0",
+        id: initializeRequest.id,
+        result: {
+          protocolVersion: PROTOCOL_VERSION,
+        },
+      });
+
+      socket.receive(JSON.stringify({ ...initializeRequest, id: 99 }));
+
+      await expect(readSentMessage(socket)).resolves.toMatchObject({
+        jsonrpc: "2.0",
+        id: 99,
+        error: {
+          code: -32600,
+          message: "Initialize not allowed on existing connection",
+        },
+      });
+      expect(initializeCalls).toBe(1);
+
+      socket.receive(JSON.stringify(sessionNewRequest));
+
+      await expect(readSentMessage(socket)).resolves.toMatchObject({
+        jsonrpc: "2.0",
+        id: sessionNewRequest.id,
+        result: {
+          sessionId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+        },
+      });
+    } finally {
+      socket.close();
+      await server.close();
+    }
+  });
+
   it("clears WebSocket client-response routes after forwarding responses", async () => {
     const registry = new ConnectionRegistry();
     const createAgent = (conn: AgentSideConnection): Agent =>
@@ -371,6 +420,20 @@ function recordingFactory(
     createdBy.push(label);
     return new TestAgent(conn);
   };
+}
+
+class RecordingInitializeAgent extends TestAgent {
+  constructor(
+    conn: AgentSideConnection,
+    private readonly onInitialize: () => void,
+  ) {
+    super(conn);
+  }
+
+  initialize(params: InitializeRequest): Promise<InitializeResponse> {
+    this.onInitialize();
+    return super.initialize(params);
+  }
 }
 
 class DelayedInitializeAgent extends TestAgent {
