@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   EVENT_STREAM_MIME_TYPE,
   HEADER_CONNECTION_ID,
@@ -10,7 +10,7 @@ import { parseSseStream } from "./sse.js";
 import { TestAgent } from "./test-support/test-agent.js";
 import { startTestServer } from "./test-support/test-http-server.js";
 
-import type { AgentSideConnection } from "./acp.js";
+import type { Agent, AgentSideConnection } from "./acp.js";
 import type { AnyMessage } from "./jsonrpc.js";
 
 const initializeRequest = {
@@ -30,6 +30,16 @@ const sessionNewRequest = {
   params: {
     cwd: "/tmp",
     mcpServers: [],
+  },
+};
+
+const promptRequest = {
+  jsonrpc: "2.0",
+  id: 3,
+  method: "session/prompt",
+  params: {
+    sessionId: "session-1",
+    prompt: [{ type: "text", text: "Hello" }],
   },
 };
 
@@ -337,6 +347,69 @@ describe("AcpServer", () => {
         },
       });
     } finally {
+      await server.close();
+    }
+  });
+
+  it("does not drain outbound subscriptions faster than SSE body demand", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let resolvePromptDone: () => void = () => {};
+    const promptDone = new Promise<void>((resolve) => {
+      resolvePromptDone = resolve;
+    });
+    const server = new AcpServer({
+      createAgent: (conn: AgentSideConnection) =>
+        createBackpressureAgent(conn, resolvePromptDone),
+    });
+    let iterator: AsyncIterator<AnyMessage> | undefined;
+    let body: ReadableStream<Uint8Array> | null | undefined;
+
+    try {
+      const connectionId = await initializeDirect(server);
+      const sseResponse = await server.handleRequest(
+        new Request("http://127.0.0.1/acp", {
+          method: "GET",
+          headers: {
+            Accept: EVENT_STREAM_MIME_TYPE,
+            [HEADER_CONNECTION_ID]: connectionId,
+            [HEADER_SESSION_ID]: "session-1",
+          },
+        }),
+      );
+      body = sseResponse.body;
+
+      expect(sseResponse.status).toBe(200);
+      expect(body).toBeDefined();
+
+      iterator = parseSseStream(body!)[Symbol.asyncIterator]();
+      const firstMessage = iterator.next();
+
+      const accepted = await server.handleRequest(
+        jsonRequest(promptRequest, {
+          [HEADER_CONNECTION_ID]: connectionId,
+          [HEADER_SESSION_ID]: "session-1",
+        }),
+      );
+
+      expect(accepted.status).toBe(202);
+      expect(chunkText(await firstMessage)).toBe("chunk-1");
+      await promptDone;
+      await waitFor(() => warnSpy.mock.calls.length > 0);
+
+      const chunkNumbers = [1];
+      for (let index = 0; index < 128; index++) {
+        const chunk = chunkText(await iterator.next());
+        chunkNumbers.push(Number(chunk.slice("chunk-".length)));
+      }
+
+      expect(hasGap(chunkNumbers)).toBe(true);
+      expect(warnSpy).toHaveBeenCalledWith(
+        "ACP outbound subscriber lagged; dropping oldest message",
+      );
+    } finally {
+      await iterator?.return?.();
+      await body?.cancel().catch(() => undefined);
+      warnSpy.mockRestore();
       await server.close();
     }
   });
@@ -806,6 +879,81 @@ async function readSseMessages(
   } finally {
     await iterator.return?.();
     await response.body.cancel();
+  }
+}
+
+function chunkText(result: IteratorResult<AnyMessage>): string {
+  if (result.done) {
+    throw new Error("Expected SSE message");
+  }
+
+  const text = (
+    result.value as {
+      params?: { update?: { content?: { text?: unknown } } };
+    }
+  ).params?.update?.content?.text;
+
+  if (typeof text !== "string") {
+    throw new Error("Expected session update chunk text");
+  }
+
+  return text;
+}
+
+function hasGap(values: readonly number[]): boolean {
+  return values.some((value, index) => {
+    if (index === 0) {
+      return false;
+    }
+
+    return value !== values[index - 1] + 1;
+  });
+}
+
+function createBackpressureAgent(
+  connection: AgentSideConnection,
+  onPromptDone: () => void,
+): Agent {
+  return {
+    initialize: () =>
+      Promise.resolve({
+        protocolVersion: 1,
+        agentCapabilities: {
+          loadSession: false,
+        },
+      }),
+    newSession: () => Promise.resolve({ sessionId: "session-1" }),
+    authenticate: () => Promise.resolve(),
+    cancel: () => Promise.resolve(),
+    prompt: async (params) => {
+      for (let index = 0; index < 1_100; index++) {
+        await connection.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: `chunk-${index + 1}`,
+            },
+          },
+        });
+      }
+
+      onPromptDone();
+      return { stopReason: "end_turn" };
+    },
+  };
+}
+
+async function waitFor(callback: () => boolean): Promise<void> {
+  const deadline = Date.now() + 1_000;
+
+  while (!callback()) {
+    if (Date.now() > deadline) {
+      throw new Error("Timed out waiting for condition");
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 1));
   }
 }
 

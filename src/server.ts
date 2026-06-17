@@ -467,8 +467,11 @@ function createSseBody(
   subscription: OutboundSubscription,
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
+  const replay = [...subscription.replay];
   let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
   let reader: ReadableStreamDefaultReader<AnyMessage> | undefined;
+  let pendingMessage: AnyMessage | undefined;
+  let isClosed = false;
 
   const clearKeepAlive = (): void => {
     if (keepAliveTimer) {
@@ -489,50 +492,110 @@ function createSseBody(
     }
   };
 
+  const hasDemand = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+  ): boolean => controller.desiredSize !== null && controller.desiredSize > 0;
+
+  const closeBody = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+  ): void => {
+    if (isClosed) {
+      return;
+    }
+
+    isClosed = true;
+    clearKeepAlive();
+
+    try {
+      controller.close();
+    } catch {
+      // Stream may already be cancelled by the consumer.
+    }
+  };
+
   return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      for (const message of subscription.replay) {
-        if (!enqueueText(controller, serializeSseEvent(message))) {
+    start(controller) {
+      keepAliveTimer = setInterval(() => {
+        if (isClosed || pendingMessage || !hasDemand(controller)) {
           return;
         }
-      }
 
-      reader = subscription.stream.getReader();
-
-      keepAliveTimer = setInterval(() => {
         if (!enqueueText(controller, serializeSseKeepAlive())) {
-          clearKeepAlive();
+          closeBody(controller);
         }
       }, 15_000);
+    },
+    async pull(controller) {
+      if (isClosed || reader || !hasDemand(controller)) {
+        return;
+      }
+
+      const replayMessage = replay.shift();
+      if (replayMessage) {
+        if (!enqueueText(controller, serializeSseEvent(replayMessage))) {
+          closeBody(controller);
+        }
+
+        return;
+      }
+
+      if (pendingMessage) {
+        const message = pendingMessage;
+        pendingMessage = undefined;
+
+        if (!enqueueText(controller, serializeSseEvent(message))) {
+          closeBody(controller);
+        }
+
+        return;
+      }
+
+      const currentReader = subscription.stream.getReader();
+      reader = currentReader;
 
       try {
-        while (true) {
-          const result = await reader.read();
+        const result = await currentReader.read();
 
-          if (result.done) {
-            return;
-          }
+        if (isClosed) {
+          return;
+        }
 
-          if (!enqueueText(controller, serializeSseEvent(result.value))) {
-            return;
-          }
+        if (result.done) {
+          closeBody(controller);
+          return;
+        }
+
+        if (!hasDemand(controller)) {
+          pendingMessage = result.value;
+          return;
+        }
+
+        if (!enqueueText(controller, serializeSseEvent(result.value))) {
+          closeBody(controller);
         }
       } catch (error) {
-        controller.error(error);
-      } finally {
-        clearKeepAlive();
-        reader.releaseLock();
-
-        try {
-          controller.close();
-        } catch {
-          // Stream may already be cancelled by the consumer.
+        if (!isClosed) {
+          isClosed = true;
+          clearKeepAlive();
+          controller.error(error);
         }
+      } finally {
+        if (reader === currentReader) {
+          reader = undefined;
+        }
+
+        currentReader.releaseLock();
       }
     },
     cancel() {
+      isClosed = true;
       clearKeepAlive();
-      void reader?.cancel();
+
+      if (reader) {
+        void reader.cancel();
+      } else {
+        void subscription.stream.cancel();
+      }
     },
   });
 }
