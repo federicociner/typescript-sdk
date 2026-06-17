@@ -95,7 +95,9 @@ export class ConnectionState {
 
   private hasStartedRouter = false;
   private inboundWriteChain: Promise<void> = Promise.resolve();
+  private initialReader: ReadableStreamDefaultReader<AnyMessage> | undefined;
   private outboundReader: ReadableStreamDefaultReader<AnyMessage> | undefined;
+  private shutdownPromise: Promise<void> | undefined;
 
   constructor(agentFactory: (conn: AgentSideConnection) => Agent) {
     this.connectionId = globalThis.crypto.randomUUID();
@@ -115,6 +117,7 @@ export class ConnectionState {
 
   async recvInitial(initializeId: string | number): Promise<AnyResponse> {
     const reader = this.outboundRx.getReader();
+    this.initialReader = reader;
 
     try {
       const result = await reader.read();
@@ -124,12 +127,19 @@ export class ConnectionState {
         !result.value ||
         !isMatchingResponse(result.value, initializeId)
       ) {
-        await this.shutdown();
+        if (!this.shutdownPromise) {
+          await this.shutdown();
+        }
+
         throw new Error("Expected initialize response from agent");
       }
 
       return result.value;
     } finally {
+      if (this.initialReader === reader) {
+        this.initialReader = undefined;
+      }
+
       reader.releaseLock();
     }
   }
@@ -164,6 +174,14 @@ export class ConnectionState {
   }
 
   async shutdown(): Promise<void> {
+    if (!this.shutdownPromise) {
+      this.shutdownPromise = this.runShutdown();
+    }
+
+    return this.shutdownPromise;
+  }
+
+  private async runShutdown(): Promise<void> {
     this.connectionStream.close();
     this.allOutbound.close();
 
@@ -177,8 +195,17 @@ export class ConnectionState {
 
     await Promise.allSettled([
       this.inboundTx.close(),
-      this.outboundReader?.cancel() ?? this.outboundRx.cancel(),
+      this.cancelOutboundReader(),
     ]);
+  }
+
+  private cancelOutboundReader(): Promise<void> {
+    const reader = this.initialReader ?? this.outboundReader;
+    if (reader) {
+      return reader.cancel();
+    }
+
+    return this.outboundRx.cancel();
   }
 
   private async writeInboundMessage(message: AnyMessage): Promise<void> {

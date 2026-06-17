@@ -7,7 +7,11 @@ import {
 import { messageIdKey } from "./protocol.js";
 import { TestAgent } from "./test-support/test-agent.js";
 
-import type { AgentSideConnection } from "./acp.js";
+import type {
+  AgentSideConnection,
+  InitializeRequest,
+  InitializeResponse,
+} from "./acp.js";
 import type { AnyMessage } from "./jsonrpc.js";
 
 const initializeRequest = {
@@ -97,6 +101,27 @@ describe("ConnectionRegistry", () => {
         },
       },
     });
+
+    registry.closeAll();
+  });
+
+  it("cancels a pending initialize reader during shutdown", async () => {
+    const initialize = createDeferred<InitializeResponse>();
+    const registry = new ConnectionRegistry();
+    const connection = registry.createConnection(
+      (conn: AgentSideConnection) =>
+        new DelayedInitializeAgent(conn, initialize.promise),
+    );
+
+    await writeInbound(connection.inboundTx, initializeRequest);
+    const initialResponse = connection.recvInitial(initializeRequest.id);
+    initialResponse.catch(() => undefined);
+
+    await connection.shutdown();
+
+    await expect(withTimeout(initialResponse)).rejects.toThrow(
+      "Expected initialize response from agent",
+    );
 
     registry.closeAll();
   });
@@ -339,6 +364,56 @@ async function readNextOrUndefined(
     ]);
   } finally {
     reader.releaseLock();
+  }
+}
+
+class DelayedInitializeAgent extends TestAgent {
+  constructor(
+    conn: AgentSideConnection,
+    private readonly initializeResponse: Promise<InitializeResponse>,
+  ) {
+    super(conn);
+  }
+
+  initialize(_params: InitializeRequest): Promise<InitializeResponse> {
+    return this.initializeResponse;
+  }
+}
+
+function createDeferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T | PromiseLike<T>) => void;
+  readonly reject: (error: unknown) => void;
+} {
+  let resolve: (value: T | PromiseLike<T>) => void = () => {};
+  let reject: (error: unknown) => void = () => {};
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+
+  return { promise, resolve, reject };
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs = 100,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error("Timed out waiting for promise"));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
 }
 
