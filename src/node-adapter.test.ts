@@ -76,6 +76,36 @@ describe("createNodeHttpHandler", () => {
     }
   });
 
+  it("aborts forwarded requests when the Node response closes before finishing", async () => {
+    const acpServer = new AcpServer({
+      createAgent: (conn: AgentSideConnection) => new TestAgent(conn),
+    });
+    const seenRequest = createDeferred<Request>();
+    const pendingResponse = createDeferred<Response>();
+    const response = new CapturingServerResponse();
+
+    acpServer.handleRequest = (req) => {
+      seenRequest.resolve(req);
+      return pendingResponse.promise;
+    };
+
+    createNodeHttpHandler(acpServer)(
+      fakeRequest(),
+      response as unknown as ServerResponse,
+    );
+
+    const request = await seenRequest.promise;
+
+    expect(request.signal.aborted).toBe(false);
+    response.emit("close");
+    expect(request.signal.aborted).toBe(true);
+
+    pendingResponse.resolve(new Response("closed", { status: 499 }));
+    await response.finished;
+
+    expect(response.statusCode).toBe(499);
+  });
+
   it("streams response bodies to ServerResponse", async () => {
     const acpServer = new AcpServer({
       createAgent: (conn: AgentSideConnection) => new TestAgent(conn),
@@ -392,19 +422,24 @@ function fakeRequest(
     readonly bodyChunks?: readonly Uint8Array[];
   } = {},
 ): IncomingMessage {
-  return {
+  const request = Object.assign(new EventEmitter(), {
     method: options.method ?? "GET",
     url: "/acp",
     headers: {
       host: "127.0.0.1",
       ...options.headers,
     },
+  });
+
+  Object.assign(request, {
     async *[Symbol.asyncIterator]() {
       for (const chunk of options.bodyChunks ?? []) {
         yield chunk;
       }
     },
-  } as unknown as IncomingMessage;
+  });
+
+  return request as unknown as IncomingMessage;
 }
 
 function createDeferred<T>(): {

@@ -83,10 +83,12 @@ async function handleNodeRequest(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
+  const requestAbort = nodeRequestAbortSignal(req, res);
+
   try {
     await writeNodeResponse(
       res,
-      await server.handleRequest(await toWebRequest(req)),
+      await server.handleRequest(await toWebRequest(req, requestAbort.signal)),
     );
   } catch (error) {
     if (!res.headersSent) {
@@ -95,6 +97,8 @@ async function handleNodeRequest(
     }
 
     res.end(error instanceof Error ? error.message : "Internal Server Error");
+  } finally {
+    requestAbort.cleanup();
   }
 }
 
@@ -102,11 +106,50 @@ function destroyUpgradeSocket(socket: Duplex, error: unknown): void {
   socket.destroy(error instanceof Error ? error : undefined);
 }
 
-async function toWebRequest(req: IncomingMessage): Promise<Request> {
+interface NodeRequestAbortSignal {
+  readonly signal: AbortSignal;
+  cleanup(): void;
+}
+
+function nodeRequestAbortSignal(
+  req: IncomingMessage,
+  res: ServerResponse,
+): NodeRequestAbortSignal {
+  const abortController = new AbortController();
+  let isFinished = false;
+
+  const onFinish = (): void => {
+    isFinished = true;
+  };
+  const onClose = (): void => {
+    if (!isFinished) {
+      abortController.abort(new Error("Node HTTP response closed"));
+    }
+  };
+
+  req.once("aborted", onClose);
+  res.once("finish", onFinish);
+  res.once("close", onClose);
+
+  return {
+    signal: abortController.signal,
+    cleanup: () => {
+      req.off("aborted", onClose);
+      res.off("finish", onFinish);
+      res.off("close", onClose);
+    },
+  };
+}
+
+async function toWebRequest(
+  req: IncomingMessage,
+  signal: AbortSignal,
+): Promise<Request> {
   return new Request(nodeRequestUrl(req), {
     method: req.method ?? "GET",
     headers: nodeHeaders(req),
     body: hasRequestBody(req) ? await readRequestBody(req) : undefined,
+    signal,
   });
 }
 

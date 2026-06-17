@@ -151,7 +151,7 @@ export class AcpServer {
 
     if (isInitializeRequest(body.value)) {
       if (!connectionId) {
-        return await this.handleInitialize(body.value, options);
+        return await this.handleInitialize(body.value, req.signal, options);
       }
 
       return textResponse("Initialize not allowed on existing connection", 400);
@@ -226,10 +226,15 @@ export class AcpServer {
 
   private async handleInitialize(
     message: AnyMessage,
+    signal: AbortSignal,
     options: HandleRequestOptions,
   ): Promise<Response> {
     if (!("id" in message) || message.id === null) {
       return textResponse("Initialize request must include an ID", 400);
+    }
+
+    if (signal.aborted) {
+      return textResponse("Request aborted", 499);
     }
 
     let connection:
@@ -240,9 +245,18 @@ export class AcpServer {
       connection = this.registry.createConnection(
         options.createAgent ?? this.createAgent,
       );
-      await writeInbound(connection, message);
+      const initialResponsePromise = writeAndReceiveInitial(
+        connection,
+        message,
+      );
+      initialResponsePromise.catch(() => undefined);
 
-      const initialResponse = await connection.recvInitial(message.id);
+      const initialResponse = await raceAbort(initialResponsePromise, signal);
+
+      if (signal.aborted) {
+        throw new RequestAbortedError();
+      }
+
       connection.startRouter();
 
       return jsonResponse(initialResponse, 200, {
@@ -251,6 +265,10 @@ export class AcpServer {
     } catch (error) {
       if (connection) {
         this.registry.remove(connection.connectionId);
+      }
+
+      if (error instanceof RequestAbortedError) {
+        return textResponse("Request aborted", 499);
       }
 
       return jsonResponse(
@@ -313,6 +331,13 @@ type RouteResult =
 
 type ClientMethodMessage = AnyRequest | AnyNotification;
 
+class RequestAbortedError extends Error {
+  constructor() {
+    super("Request aborted");
+    this.name = "RequestAbortedError";
+  }
+}
+
 async function readJson(req: Request): Promise<JsonResult> {
   try {
     return {
@@ -331,6 +356,46 @@ async function writeInbound(
   message: AnyMessage,
 ): Promise<void> {
   await connection.writeInbound(message);
+}
+
+async function writeAndReceiveInitial(
+  connection: ConnectionState,
+  message: AnyMessage,
+): Promise<AnyResponse> {
+  await writeInbound(connection, message);
+
+  if (!("id" in message) || message.id === null) {
+    throw new Error("Initialize request must include an ID");
+  }
+
+  return await connection.recvInitial(message.id);
+}
+
+async function raceAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  if (signal.aborted) {
+    throw new RequestAbortedError();
+  }
+
+  let removeAbortListener: () => void = () => {};
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    const onAbort = (): void => {
+      reject(new RequestAbortedError());
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    removeAbortListener = () => {
+      signal.removeEventListener("abort", onAbort);
+    };
+  });
+
+  try {
+    return await Promise.race([promise, abortPromise]);
+  } finally {
+    removeAbortListener();
+  }
 }
 
 async function forwardClientMethodMessage(

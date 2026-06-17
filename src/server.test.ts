@@ -183,6 +183,71 @@ describe("AcpServer", () => {
     }
   });
 
+  it("discards HTTP initialize connections when the request aborts", async () => {
+    const agentCreated = createDeferred<void>();
+    const initializeStarted = createDeferred<void>();
+    const initializeResponse = createDeferred<{
+      protocolVersion: 1;
+      agentCapabilities: { loadSession: false };
+    }>();
+    const connectionClosed = createDeferred<void>();
+    const abortController = new AbortController();
+    const server = new AcpServer({
+      createAgent: (conn: AgentSideConnection): Agent => {
+        queueMicrotask(() => {
+          if (conn.signal.aborted) {
+            connectionClosed.resolve();
+            return;
+          }
+
+          conn.signal.addEventListener(
+            "abort",
+            () => {
+              connectionClosed.resolve();
+            },
+            { once: true },
+          );
+        });
+        agentCreated.resolve();
+
+        return {
+          initialize: () => {
+            initializeStarted.resolve();
+            return initializeResponse.promise;
+          },
+          newSession: () => Promise.resolve({ sessionId: "session-1" }),
+          authenticate: () => Promise.resolve(),
+          cancel: () => Promise.resolve(),
+          prompt: () => Promise.resolve({ stopReason: "end_turn" }),
+        };
+      },
+    });
+
+    try {
+      const responsePromise = server.handleRequest(
+        jsonRequest(initializeRequest, {}, abortController.signal),
+      );
+
+      await agentCreated.promise;
+      await withTimeout(initializeStarted.promise);
+      abortController.abort();
+
+      const response = await withTimeout(responsePromise);
+
+      expect(response.status).toBe(499);
+      expect(response.headers.get(HEADER_CONNECTION_ID)).toBeNull();
+      await withTimeout(connectionClosed.promise);
+
+      initializeResponse.resolve({
+        protocolVersion: 1,
+        agentCapabilities: { loadSession: false },
+      });
+      await flushMicrotasks();
+    } finally {
+      await server.close();
+    }
+  });
+
   it("ignores HTTP factory overrides for existing-connection POST requests", async () => {
     const createdBy: string[] = [];
     const server = new AcpServer({
@@ -785,6 +850,7 @@ async function initializeDirect(server: AcpServer): Promise<string> {
 function jsonRequest(
   body: unknown,
   headers: Record<string, string> = {},
+  signal?: AbortSignal,
 ): Request {
   return new Request("http://127.0.0.1/acp", {
     method: "POST",
@@ -793,6 +859,7 @@ function jsonRequest(
       ...headers,
     },
     body: JSON.stringify(body),
+    signal,
   });
 }
 
@@ -955,6 +1022,43 @@ async function waitFor(callback: () => boolean): Promise<void> {
 
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
+}
+
+function createDeferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T | PromiseLike<T>) => void;
+  readonly reject: (error: unknown) => void;
+} {
+  let resolve: (value: T | PromiseLike<T>) => void = () => {};
+  let reject: (error: unknown) => void = () => {};
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+
+  return { promise, resolve, reject };
+}
+
+async function withTimeout<T>(promise: Promise<T>): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error("Timed out waiting for promise"));
+        }, 1_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function flushMicrotasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 function postJson(
