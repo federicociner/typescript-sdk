@@ -834,6 +834,87 @@ describe("createHttpStream", () => {
     }
   });
 
+  it("aborts in-flight connected POSTs when closed", async () => {
+    const connectedPostAborted = createDeferred<void>();
+    const requests: RecordedRequest[] = [];
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const method = init?.method ?? "GET";
+      const headers = new Headers(init?.headers);
+      const signal = init?.signal;
+      requests.push({
+        url: String(input),
+        method,
+        headers,
+        body: bodyToString(init?.body),
+        credentials: init?.credentials,
+        signal,
+      });
+
+      if (method === "POST" && !headers.has(HEADER_CONNECTION_ID)) {
+        return jsonResponse(initializeResponse, 200, {
+          [HEADER_CONNECTION_ID]: "connection-1",
+        });
+      }
+
+      if (method === "GET") {
+        return sseResponse(signal);
+      }
+
+      if (method === "POST" && headers.has(HEADER_CONNECTION_ID)) {
+        return await new Promise<Response>((_resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => {
+              connectedPostAborted.resolve();
+              reject(new Error("connected POST aborted"));
+            },
+            { once: true },
+          );
+        });
+      }
+
+      if (method === "DELETE") {
+        return new Response(null, { status: 202 });
+      }
+
+      throw new Error(`Unexpected ${method} request`);
+    };
+    const stream = createHttpStream("https://agent.example/acp", { fetch });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await writer.write(initializeRequest);
+      await readMessage(reader);
+
+      const write = writer.write(sessionNewRequest);
+      await flushMicrotasks();
+
+      const postRequest = requestAt(requests, 2);
+      expect(postRequest.method).toBe("POST");
+      expect(postRequest.headers.get(HEADER_CONNECTION_ID)).toBe(
+        "connection-1",
+      );
+      expect(postRequest.signal?.aborted).toBe(false);
+
+      const cancel = reader.cancel();
+      await connectedPostAborted.promise;
+
+      expect(postRequest.signal?.aborted).toBe(true);
+      await expect(write).rejects.toThrow("connected POST aborted");
+      await cancel;
+
+      const deleteRequest = requestAt(requests, 3);
+      expect(deleteRequest.method).toBe("DELETE");
+      expect(deleteRequest.headers.get(HEADER_CONNECTION_ID)).toBe(
+        "connection-1",
+      );
+    } finally {
+      writer.releaseLock();
+      await closeStream(stream);
+    }
+  });
+
   it("errors and tears down local resources when connected POST fails", async () => {
     const clearSpy = vi.spyOn(MemoryAcpCookieStore.prototype, "clear");
     const controlledFetch = createControlledFetch({
@@ -1234,6 +1315,7 @@ interface RecordedRequest {
   readonly headers: Headers;
   readonly body: string;
   readonly credentials: RequestCredentials | undefined;
+  readonly signal: AbortSignal | null | undefined;
 }
 
 interface RecordedSseRequest {
@@ -1304,6 +1386,7 @@ function createControlledFetch(
         headers,
         body: bodyToString(init?.body),
         credentials: init?.credentials,
+        signal: init?.signal,
       });
 
       if (method === "POST" && !headers.has(HEADER_CONNECTION_ID)) {
@@ -1499,6 +1582,22 @@ function jsonResponse(
     headers: {
       "Content-Type": JSON_MIME_TYPE,
       ...headers,
+    },
+  });
+}
+
+function sseResponse(signal: AbortSignal | null | undefined): Response {
+  const stream = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = stream.writable.getWriter();
+
+  signal?.addEventListener("abort", () => {
+    void writer.close().catch(() => undefined);
+  });
+
+  return new Response(stream.readable, {
+    status: 200,
+    headers: {
+      "Content-Type": EVENT_STREAM_MIME_TYPE,
     },
   });
 }

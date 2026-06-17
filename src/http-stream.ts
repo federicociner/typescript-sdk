@@ -220,6 +220,7 @@ class HttpStreamTransport {
           ...(sessionId ? { [HEADER_SESSION_ID]: sessionId } : {}),
         },
         body: JSON.stringify(message),
+        signal: this.abortController.signal,
       });
 
       if (!response.ok) {
