@@ -183,6 +183,38 @@ describe("AcpServer", () => {
     }
   });
 
+  it("waits for registry shutdowns before close resolves", async () => {
+    const server = new AcpServer({
+      createAgent: (conn: AgentSideConnection) => new TestAgent(conn),
+    });
+    const registry = (
+      server as unknown as {
+        registry: {
+          closeAll(): Promise<void>;
+        };
+      }
+    ).registry;
+    const shutdownStarted = createDeferred<void>();
+    const allowShutdown = createDeferred<void>();
+    vi.spyOn(registry, "closeAll").mockImplementation(async () => {
+      shutdownStarted.resolve();
+      await allowShutdown.promise;
+    });
+    let closeResolved = false;
+
+    const close = server.close().then(() => {
+      closeResolved = true;
+    });
+
+    await shutdownStarted.promise;
+    await flushMicrotasks();
+    expect(closeResolved).toBe(false);
+
+    allowShutdown.resolve();
+    await close;
+    expect(closeResolved).toBe(true);
+  });
+
   it("discards HTTP initialize connections when the request aborts", async () => {
     const agentCreated = createDeferred<void>();
     const initializeStarted = createDeferred<void>();

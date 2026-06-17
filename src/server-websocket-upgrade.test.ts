@@ -382,7 +382,7 @@ describe("AcpServer prepared WebSocket upgrades", () => {
       expect(connection.clientResponseRoutes.size).toBe(0);
     } finally {
       socket.close();
-      registry.closeAll();
+      await registry.closeAll();
     }
   });
 

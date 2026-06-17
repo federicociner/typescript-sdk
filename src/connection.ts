@@ -368,17 +368,17 @@ export class ConnectionRegistry {
     return connection;
   }
 
-  closeAll(): void {
-    for (const connection of this.connections.values()) {
-      void connection.shutdown();
-    }
-
-    for (const connection of this.pendingConnections.values()) {
-      void connection.shutdown();
-    }
-
+  async closeAll(): Promise<void> {
+    const connections = new Set([
+      ...this.connections.values(),
+      ...this.pendingConnections.values(),
+    ]);
     this.connections.clear();
     this.pendingConnections.clear();
+
+    await Promise.all(
+      Array.from(connections, (connection) => connection.shutdown()),
+    );
   }
 }
 

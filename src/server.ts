@@ -120,7 +120,7 @@ export class AcpServer {
 
   /** Closes all active ACP connections owned by this server. */
   async close(): Promise<void> {
-    this.registry.closeAll();
+    await this.registry.closeAll();
   }
 
   private async handlePost(

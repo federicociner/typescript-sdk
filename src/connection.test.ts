@@ -52,7 +52,7 @@ const messageThree = { jsonrpc: "2.0", id: 3, result: "three" } as const;
 const messageFour = { jsonrpc: "2.0", id: 4, result: "four" } as const;
 
 describe("ConnectionRegistry", () => {
-  it("creates retrievable connections with unique UUID connection IDs", () => {
+  it("creates retrievable connections with unique UUID connection IDs", async () => {
     const registry = new ConnectionRegistry();
     const first = registry.createConnection(
       (conn: AgentSideConnection) => new TestAgent(conn),
@@ -67,7 +67,7 @@ describe("ConnectionRegistry", () => {
     expect(registry.get(first.connectionId)).toBe(first);
     expect(registry.get(second.connectionId)).toBe(second);
 
-    registry.closeAll();
+    await registry.closeAll();
   });
 
   it("removes connections", () => {
@@ -102,7 +102,7 @@ describe("ConnectionRegistry", () => {
       },
     });
 
-    registry.closeAll();
+    await registry.closeAll();
   });
 
   it("cancels a pending initialize reader during shutdown", async () => {
@@ -123,7 +123,53 @@ describe("ConnectionRegistry", () => {
       "Expected initialize response from agent",
     );
 
-    registry.closeAll();
+    await registry.closeAll();
+  });
+
+  it("waits for active and pending connection shutdowns before closeAll resolves", async () => {
+    const registry = new ConnectionRegistry();
+    const active = registry.createConnection(
+      (conn: AgentSideConnection) => new TestAgent(conn),
+    );
+    const pending = registry.createPendingConnection(
+      (conn: AgentSideConnection) => new TestAgent(conn),
+    );
+    const activeShutdownStarted = createDeferred<void>();
+    const pendingShutdownStarted = createDeferred<void>();
+    const allowActiveShutdown = createDeferred<void>();
+    const allowPendingShutdown = createDeferred<void>();
+    const originalActiveShutdown = active.shutdown.bind(active);
+    const originalPendingShutdown = pending.shutdown.bind(pending);
+    vi.spyOn(active, "shutdown").mockImplementation(async () => {
+      activeShutdownStarted.resolve();
+      await allowActiveShutdown.promise;
+      await originalActiveShutdown();
+    });
+    vi.spyOn(pending, "shutdown").mockImplementation(async () => {
+      pendingShutdownStarted.resolve();
+      await allowPendingShutdown.promise;
+      await originalPendingShutdown();
+    });
+    let closeResolved = false;
+
+    const close = registry.closeAll().then(() => {
+      closeResolved = true;
+    });
+
+    await activeShutdownStarted.promise;
+    await pendingShutdownStarted.promise;
+    await flushMicrotasks();
+
+    expect(registry.get(active.connectionId)).toBeUndefined();
+    expect(closeResolved).toBe(false);
+
+    allowActiveShutdown.resolve();
+    await flushMicrotasks();
+    expect(closeResolved).toBe(false);
+
+    allowPendingShutdown.resolve();
+    await close;
+    expect(closeResolved).toBe(true);
   });
 
   it("routes pending responses to the connection stream and all outbound stream", async () => {
@@ -156,7 +202,7 @@ describe("ConnectionRegistry", () => {
     expect(allOutboundMessage).toMatchObject(connectionMessage);
     expect(connection.pendingRoutes.has(key ?? "")).toBe(false);
 
-    registry.closeAll();
+    await registry.closeAll();
   });
 
   it("falls back to the connection stream for responses without a pending route", async () => {
@@ -179,10 +225,10 @@ describe("ConnectionRegistry", () => {
       },
     });
 
-    registry.closeAll();
+    await registry.closeAll();
   });
 
-  it("returns the same session stream for repeated ensureSession calls", () => {
+  it("returns the same session stream for repeated ensureSession calls", async () => {
     const registry = new ConnectionRegistry();
     const connection = registry.createConnection(
       (conn: AgentSideConnection) => new TestAgent(conn),
@@ -196,7 +242,7 @@ describe("ConnectionRegistry", () => {
       connection.ensureSession(sessionId),
     );
 
-    registry.closeAll();
+    await registry.closeAll();
   });
 
   it("routes session responses and notifications to the session stream", async () => {
@@ -243,7 +289,7 @@ describe("ConnectionRegistry", () => {
       await readNextOrUndefined(connectionSubscription.stream),
     ).toBeUndefined();
 
-    registry.closeAll();
+    await registry.closeAll();
   });
 });
 
@@ -421,6 +467,11 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+async function flushMicrotasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 const routeShapeCheck = "connection" satisfies ResponseRoute;
