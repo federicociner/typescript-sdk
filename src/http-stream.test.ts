@@ -199,11 +199,16 @@ describe("createHttpStream", () => {
     }
   });
 
-  it("deletes the initialized connection when the initialize response is malformed", async () => {
+  it("deletes the initialized connection when the initialize body is not a response", async () => {
     const clearSpy = vi.spyOn(MemoryAcpCookieStore.prototype, "clear");
     const controlledFetch = createControlledFetch({
       initializeCookies: ["transport=alpha; Path=/"],
-      initializeResponse: { notJsonRpc: true },
+      initializeResponse: {
+        jsonrpc: "2.0",
+        id: 0,
+        method: "session/new",
+        params: {},
+      },
     });
     const stream = createHttpStream("https://agent.example/acp", {
       fetch: controlledFetch.fetch,
@@ -213,7 +218,7 @@ describe("createHttpStream", () => {
 
     try {
       await expect(writer.write(initializeRequest)).rejects.toThrow(
-        "ACP initialize response was not a JSON-RPC message",
+        "ACP initialize response was not a JSON-RPC response",
       );
       const deleteRequest = requestAt(controlledFetch.requests, 1);
       expect(deleteRequest.method).toBe("DELETE");
@@ -225,7 +230,46 @@ describe("createHttpStream", () => {
       await flushMicrotasks();
       expect(clearSpy).toHaveBeenCalledTimes(1);
       await expect(reader.read()).rejects.toThrow(
-        "ACP initialize response was not a JSON-RPC message",
+        "ACP initialize response was not a JSON-RPC response",
+      );
+    } finally {
+      clearSpy.mockRestore();
+      reader.releaseLock();
+      writer.releaseLock();
+      await closeStream(stream);
+    }
+  });
+
+  it("deletes the initialized connection when the initialize response id does not match", async () => {
+    const clearSpy = vi.spyOn(MemoryAcpCookieStore.prototype, "clear");
+    const controlledFetch = createControlledFetch({
+      initializeCookies: ["transport=alpha; Path=/"],
+      initializeResponse: {
+        ...initializeResponse,
+        id: 999,
+      },
+    });
+    const stream = createHttpStream("https://agent.example/acp", {
+      fetch: controlledFetch.fetch,
+    });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await expect(writer.write(initializeRequest)).rejects.toThrow(
+        "ACP initialize response id did not match initialize request",
+      );
+      const deleteRequest = requestAt(controlledFetch.requests, 1);
+      expect(deleteRequest.method).toBe("DELETE");
+      expect(deleteRequest.headers.get(HEADER_CONNECTION_ID)).toBe(
+        "connection-1",
+      );
+      expect(deleteRequest.headers.get("Cookie")).toBe("transport=alpha");
+      expect(controlledFetch.sseRequests).toHaveLength(0);
+      await flushMicrotasks();
+      expect(clearSpy).toHaveBeenCalledTimes(1);
+      await expect(reader.read()).rejects.toThrow(
+        "ACP initialize response id did not match initialize request",
       );
     } finally {
       clearSpy.mockRestore();

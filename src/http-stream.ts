@@ -1,4 +1,4 @@
-import { isJsonRpcMessage, isResponseMessage } from "./jsonrpc.js";
+import { isResponseMessage } from "./jsonrpc.js";
 import {
   EVENT_STREAM_MIME_TYPE,
   HEADER_CONNECTION_ID,
@@ -126,6 +126,8 @@ class HttpStreamTransport {
   }
 
   private async postInitialize(message: AnyMessage): Promise<void> {
+    let cleanupConnectionId: string | undefined;
+
     try {
       if (!isInitializeRequest(message)) {
         throw new Error("ACP HTTP stream first message must be initialize");
@@ -148,17 +150,27 @@ class HttpStreamTransport {
         throw new Error("ACP initialize response missing Acp-Connection-Id");
       }
 
-      this.connectionId = connectionId;
+      cleanupConnectionId = connectionId;
 
       const body: unknown = await response.json();
-      if (!isJsonRpcMessage(body)) {
-        throw new Error("ACP initialize response was not a JSON-RPC message");
+      if (!isResponseMessage(body)) {
+        throw new Error("ACP initialize response was not a JSON-RPC response");
       }
 
+      const responseIdKey = messageIdKey(body.id);
+      const requestIdKey =
+        "id" in message ? messageIdKey(message.id) : undefined;
+      if (responseIdKey !== requestIdKey) {
+        throw new Error(
+          "ACP initialize response id did not match initialize request",
+        );
+      }
+
+      this.connectionId = connectionId;
       this.openConnectionSse();
       this.enqueue(body);
     } catch (error) {
-      this.errorReadable(error);
+      this.errorReadable(error, cleanupConnectionId);
       throw error;
     }
   }
@@ -454,8 +466,9 @@ class HttpStreamTransport {
     }
   }
 
-  private async deleteConnection(): Promise<void> {
-    const connectionId = this.connectionId;
+  private async deleteConnection(
+    connectionId: string | undefined = this.connectionId,
+  ): Promise<void> {
     if (!connectionId) {
       return;
     }
@@ -486,14 +499,17 @@ class HttpStreamTransport {
     }
   }
 
-  private errorReadable(error: unknown): void {
+  private errorReadable(
+    error: unknown,
+    connectionId: string | undefined = this.connectionId,
+  ): void {
     if (this.isClosed) {
       return;
     }
 
     this.isClosed = true;
     this.abortController.abort();
-    void this.deleteConnection()
+    void this.deleteConnection(connectionId)
       .catch(() => undefined)
       .finally(() => {
         this.clearOwnedCookieStore();
