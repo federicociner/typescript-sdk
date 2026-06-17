@@ -139,6 +139,7 @@ class HttpStreamTransport {
           "Content-Type": JSON_MIME_TYPE,
         },
         body: JSON.stringify(message),
+        signal: this.abortController.signal,
       });
 
       if (!response.ok) {
@@ -151,8 +152,11 @@ class HttpStreamTransport {
       }
 
       cleanupConnectionId = connectionId;
+      this.throwIfClosedDuringInitialize();
 
       const body: unknown = await response.json();
+      this.throwIfClosedDuringInitialize();
+
       if (!isResponseMessage(body)) {
         throw new Error("ACP initialize response was not a JSON-RPC response");
       }
@@ -170,8 +174,20 @@ class HttpStreamTransport {
       this.openConnectionSse();
       this.enqueue(body);
     } catch (error) {
-      this.errorReadable(error, cleanupConnectionId);
+      if (this.isClosed && cleanupConnectionId) {
+        await this.deleteConnection(cleanupConnectionId).catch(() => undefined);
+        this.clearOwnedCookieStore();
+      } else {
+        this.errorReadable(error, cleanupConnectionId);
+      }
+
       throw error;
+    }
+  }
+
+  private throwIfClosedDuringInitialize(): void {
+    if (this.isClosed) {
+      throw new Error("ACP HTTP stream is closed");
     }
   }
 

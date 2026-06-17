@@ -199,6 +199,69 @@ describe("createHttpStream", () => {
     }
   });
 
+  it("aborts and deletes late initialize connections when canceled during initialize POST", async () => {
+    const clearSpy = vi.spyOn(MemoryAcpCookieStore.prototype, "clear");
+    const initializeResponseDeferred = createDeferred<Response>();
+    const requests: Array<{
+      readonly method: string;
+      readonly headers: Headers;
+      readonly signal: AbortSignal | null | undefined;
+    }> = [];
+    const fetch: typeof globalThis.fetch = async (_input, init) => {
+      const method = init?.method ?? "GET";
+      const headers = new Headers(init?.headers);
+      requests.push({
+        method,
+        headers,
+        signal: init?.signal,
+      });
+
+      if (method === "POST" && !headers.has(HEADER_CONNECTION_ID)) {
+        return await initializeResponseDeferred.promise;
+      }
+
+      if (method === "DELETE") {
+        return new Response(null, { status: 202 });
+      }
+
+      throw new Error(`Unexpected ${method} request`);
+    };
+    const stream = createHttpStream("https://agent.example/acp", { fetch });
+    const writer = stream.writable.getWriter();
+
+    try {
+      const write = writer.write(initializeRequest);
+      await flushMicrotasks();
+      expect(requests).toHaveLength(1);
+      expect(requests[0].signal?.aborted).toBe(false);
+
+      stream.readable.cancel().catch(() => undefined);
+      await flushMicrotasks();
+
+      expect(requests[0].signal?.aborted).toBe(true);
+      initializeResponseDeferred.resolve(
+        jsonResponse(initializeResponse, 200, {
+          [HEADER_CONNECTION_ID]: "connection-1",
+          ...setCookieResponseHeaders(["transport=alpha; Path=/"]),
+        }),
+      );
+
+      await expect(write).rejects.toThrow("ACP HTTP stream is closed");
+
+      expect(requests).toHaveLength(2);
+      expect(requests[1].method).toBe("DELETE");
+      expect(requests[1].headers.get(HEADER_CONNECTION_ID)).toBe(
+        "connection-1",
+      );
+      expect(requests[1].headers.get("Cookie")).toBe("transport=alpha");
+      expect(clearSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      clearSpy.mockRestore();
+      writer.releaseLock();
+      await closeStream(stream);
+    }
+  });
+
   it("deletes the initialized connection when the initialize body is not a response", async () => {
     const clearSpy = vi.spyOn(MemoryAcpCookieStore.prototype, "clear");
     const controlledFetch = createControlledFetch({
