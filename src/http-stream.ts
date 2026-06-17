@@ -126,35 +126,41 @@ class HttpStreamTransport {
   }
 
   private async postInitialize(message: AnyMessage): Promise<void> {
-    if (!isInitializeRequest(message)) {
-      throw new Error("ACP HTTP stream first message must be initialize");
+    try {
+      if (!isInitializeRequest(message)) {
+        throw new Error("ACP HTTP stream first message must be initialize");
+      }
+
+      const response = await this.fetchRequest({
+        method: "POST",
+        headers: {
+          "Content-Type": JSON_MIME_TYPE,
+        },
+        body: JSON.stringify(message),
+      });
+
+      if (!response.ok) {
+        throw await httpError("ACP initialize failed", response);
+      }
+
+      const connectionId = response.headers.get(HEADER_CONNECTION_ID);
+      if (!connectionId) {
+        throw new Error("ACP initialize response missing Acp-Connection-Id");
+      }
+
+      this.connectionId = connectionId;
+
+      const body: unknown = await response.json();
+      if (!isJsonRpcMessage(body)) {
+        throw new Error("ACP initialize response was not a JSON-RPC message");
+      }
+
+      this.openConnectionSse();
+      this.enqueue(body);
+    } catch (error) {
+      this.errorReadable(error);
+      throw error;
     }
-
-    const response = await this.fetchRequest({
-      method: "POST",
-      headers: {
-        "Content-Type": JSON_MIME_TYPE,
-      },
-      body: JSON.stringify(message),
-    });
-
-    if (!response.ok) {
-      throw await httpError("ACP initialize failed", response);
-    }
-
-    const connectionId = response.headers.get(HEADER_CONNECTION_ID);
-    if (!connectionId) {
-      throw new Error("ACP initialize response missing Acp-Connection-Id");
-    }
-
-    const body: unknown = await response.json();
-    if (!isJsonRpcMessage(body)) {
-      throw new Error("ACP initialize response was not a JSON-RPC message");
-    }
-
-    this.connectionId = connectionId;
-    this.openConnectionSse();
-    this.enqueue(body);
   }
 
   private async postConnectedMessage(message: AnyMessage): Promise<void> {

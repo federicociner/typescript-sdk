@@ -170,6 +170,71 @@ describe("createHttpStream", () => {
     }
   });
 
+  it("errors and clears local resources when initialize POST fails", async () => {
+    const clearSpy = vi.spyOn(MemoryAcpCookieStore.prototype, "clear");
+    const controlledFetch = createControlledFetch({
+      initializeCookies: ["transport=alpha; Path=/"],
+      initializeStatus: 401,
+      initializeBody: "expired",
+    });
+    const stream = createHttpStream("https://agent.example/acp", {
+      fetch: controlledFetch.fetch,
+    });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await expect(writer.write(initializeRequest)).rejects.toThrow(
+        "ACP initialize failed: 401",
+      );
+      expect(controlledFetch.requests).toHaveLength(1);
+      await flushMicrotasks();
+      expect(clearSpy).toHaveBeenCalledTimes(1);
+      await expect(reader.read()).rejects.toThrow("ACP initialize failed");
+    } finally {
+      clearSpy.mockRestore();
+      reader.releaseLock();
+      writer.releaseLock();
+      await closeStream(stream);
+    }
+  });
+
+  it("deletes the initialized connection when the initialize response is malformed", async () => {
+    const clearSpy = vi.spyOn(MemoryAcpCookieStore.prototype, "clear");
+    const controlledFetch = createControlledFetch({
+      initializeCookies: ["transport=alpha; Path=/"],
+      initializeResponse: { notJsonRpc: true },
+    });
+    const stream = createHttpStream("https://agent.example/acp", {
+      fetch: controlledFetch.fetch,
+    });
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+
+    try {
+      await expect(writer.write(initializeRequest)).rejects.toThrow(
+        "ACP initialize response was not a JSON-RPC message",
+      );
+      const deleteRequest = requestAt(controlledFetch.requests, 1);
+      expect(deleteRequest.method).toBe("DELETE");
+      expect(deleteRequest.headers.get(HEADER_CONNECTION_ID)).toBe(
+        "connection-1",
+      );
+      expect(deleteRequest.headers.get("Cookie")).toBe("transport=alpha");
+      expect(controlledFetch.sseRequests).toHaveLength(0);
+      await flushMicrotasks();
+      expect(clearSpy).toHaveBeenCalledTimes(1);
+      await expect(reader.read()).rejects.toThrow(
+        "ACP initialize response was not a JSON-RPC message",
+      );
+    } finally {
+      clearSpy.mockRestore();
+      reader.releaseLock();
+      writer.releaseLock();
+      await closeStream(stream);
+    }
+  });
+
   it("opens session SSE after session creation and includes the session header on session-scoped POSTs", async () => {
     const controlledFetch = createControlledFetch();
     const stream = createHttpStream("https://agent.example/acp", {
@@ -1084,6 +1149,9 @@ interface TestClientState {
 
 interface ControlledFetchOptions {
   readonly initializeCookies?: readonly string[];
+  readonly initializeStatus?: number;
+  readonly initializeBody?: string;
+  readonly initializeResponse?: unknown;
   readonly getCookies?: readonly string[];
   readonly getStatus?: number;
   readonly postStatus?: number;
@@ -1132,10 +1200,22 @@ function createControlledFetch(
       });
 
       if (method === "POST" && !headers.has(HEADER_CONNECTION_ID)) {
-        return jsonResponse(initializeResponse, 200, {
-          [HEADER_CONNECTION_ID]: "connection-1",
-          ...setCookieResponseHeaders(options.initializeCookies),
-        });
+        const status = options.initializeStatus ?? 200;
+        if (status !== 200) {
+          return new Response(options.initializeBody ?? null, {
+            status,
+            headers: setCookieResponseHeaders(options.initializeCookies),
+          });
+        }
+
+        return jsonResponse(
+          options.initializeResponse ?? initializeResponse,
+          200,
+          {
+            [HEADER_CONNECTION_ID]: "connection-1",
+            ...setCookieResponseHeaders(options.initializeCookies),
+          },
+        );
       }
 
       if (method === "DELETE" && options.deleteError) {
@@ -1303,7 +1383,7 @@ function bodyToString(body: BodyInit | null | undefined): string {
 }
 
 function jsonResponse(
-  body: AnyMessage,
+  body: unknown,
   status: number,
   headers: Record<string, string>,
 ): Response {
