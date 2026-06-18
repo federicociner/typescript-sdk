@@ -1,33 +1,2184 @@
-import { z } from "zod/v4";
 import * as schema from "./schema/index.js";
 import * as validate from "./schema/zod.gen.js";
 export type * from "./schema/types.gen.js";
-export * from "./schema/index.js";
+export {
+  AGENT_METHODS,
+  CLIENT_METHODS,
+  PROTOCOL_VERSION,
+} from "./schema/index.js";
 export * from "./stream.js";
-
-import type { Stream } from "./stream.js";
-import type {
+export {
+  Connection,
+  ConnectionBuilder,
+  ConnectionContext,
+  Handled,
+  HandlerRegistration,
+  RequestError,
+  RequestResponder,
+} from "./jsonrpc.js";
+export type {
+  AnyNotification,
   AnyMessage,
+  AnyRequest,
   AnyResponse,
-  Result,
+  ConnectionOptions,
   ErrorResponse,
-  RequestHandler,
+  HandleResult,
+  IncomingNotification,
+  IncomingMessage,
+  IncomingRequest,
+  JsonRpcHandler,
+  MaybePromise,
+  NotificationCallback,
   NotificationHandler,
+  RequestCallback,
+  RequestHandler,
+  Result,
 } from "./jsonrpc.js";
 
-type ConnectionPendingResponse = {
-  resolve: (response: unknown) => void;
-  reject: (error: unknown) => void;
-};
+import type { Stream } from "./stream.js";
+import { Connection, Handled, HandlerRegistration } from "./jsonrpc.js";
+import type {
+  AnyMessage,
+  ConnectionBuilder,
+  ConnectionContext,
+  HandleResult,
+  IncomingMessage,
+  JsonRpcHandler,
+  MaybePromise,
+} from "./jsonrpc.js";
 
-function emptyObjectResponse<T>(response: T | null | undefined): T {
+function emptyObjectResponse<T>(response: T | null | undefined | void): T {
   return response ?? ({} as T);
 }
 
-function rejectedPromise<T>(error: unknown): Promise<T> {
-  const promise = Promise.reject<T>(error);
-  promise.catch(() => {});
-  return promise;
+function isStream(value: unknown): value is Stream {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "readable" in value &&
+    "writable" in value
+  );
+}
+
+function memoryStreamPair(): [Stream, Stream] {
+  const leftToRight = new TransformStream<AnyMessage>();
+  const rightToLeft = new TransformStream<AnyMessage>();
+  return [
+    {
+      readable: rightToLeft.readable,
+      writable: leftToRight.writable,
+    },
+    {
+      readable: leftToRight.readable,
+      writable: rightToLeft.writable,
+    },
+  ];
+}
+
+function connectInProcess(
+  connectThis: (stream: Stream) => Connection,
+  connectPeer: (stream: Stream) => Connection,
+): Connection {
+  const [thisStream, peerStream] = memoryStreamPair();
+  const peerConnection = connectPeer(peerStream);
+  const connection = connectThis(thisStream);
+  void connection.closed.then(() => peerConnection.close());
+  void peerConnection.closed.then(() => connection.close());
+  return connection;
+}
+
+/**
+ * ACP method-name constants.
+ *
+ * Use these with `onRequest(...)`, `onNotification(...)`, `request(...)`, and
+ * `notify(...)` when you want literal-string type inference without spelling
+ * protocol strings inline.
+ */
+export const methods = {
+  agent: {
+    initialize: schema.AGENT_METHODS.initialize,
+    authenticate: schema.AGENT_METHODS.authenticate,
+    logout: schema.AGENT_METHODS.logout,
+    providers: {
+      list: schema.AGENT_METHODS.providers_list,
+      set: schema.AGENT_METHODS.providers_set,
+      disable: schema.AGENT_METHODS.providers_disable,
+    },
+    session: {
+      new: schema.AGENT_METHODS.session_new,
+      load: schema.AGENT_METHODS.session_load,
+      list: schema.AGENT_METHODS.session_list,
+      delete: schema.AGENT_METHODS.session_delete,
+      fork: schema.AGENT_METHODS.session_fork,
+      resume: schema.AGENT_METHODS.session_resume,
+      close: schema.AGENT_METHODS.session_close,
+      setMode: schema.AGENT_METHODS.session_set_mode,
+      setConfigOption: schema.AGENT_METHODS.session_set_config_option,
+      prompt: schema.AGENT_METHODS.session_prompt,
+      cancel: schema.AGENT_METHODS.session_cancel,
+    },
+    nes: {
+      start: schema.AGENT_METHODS.nes_start,
+      suggest: schema.AGENT_METHODS.nes_suggest,
+      accept: schema.AGENT_METHODS.nes_accept,
+      reject: schema.AGENT_METHODS.nes_reject,
+      close: schema.AGENT_METHODS.nes_close,
+    },
+    document: {
+      didOpen: schema.AGENT_METHODS.document_did_open,
+      didChange: schema.AGENT_METHODS.document_did_change,
+      didClose: schema.AGENT_METHODS.document_did_close,
+      didSave: schema.AGENT_METHODS.document_did_save,
+      didFocus: schema.AGENT_METHODS.document_did_focus,
+    },
+  },
+  client: {
+    session: {
+      requestPermission: schema.CLIENT_METHODS.session_request_permission,
+      update: schema.CLIENT_METHODS.session_update,
+    },
+    fs: {
+      writeTextFile: schema.CLIENT_METHODS.fs_write_text_file,
+      readTextFile: schema.CLIENT_METHODS.fs_read_text_file,
+    },
+    terminal: {
+      create: schema.CLIENT_METHODS.terminal_create,
+      output: schema.CLIENT_METHODS.terminal_output,
+      release: schema.CLIENT_METHODS.terminal_release,
+      waitForExit: schema.CLIENT_METHODS.terminal_wait_for_exit,
+      kill: schema.CLIENT_METHODS.terminal_kill,
+    },
+    elicitation: {
+      create: schema.CLIENT_METHODS.elicitation_create,
+      complete: schema.CLIENT_METHODS.elicitation_complete,
+    },
+  },
+} as const;
+
+const startActiveSession = Symbol("startActiveSession");
+
+/**
+ * Base class for app-style ACP contexts.
+ *
+ * `AgentContext` and `ClientContext` expose a small method-based surface for
+ * sending typed requests and notifications. Extend this class only when
+ * building custom context wrappers around the lower-level JSON-RPC connection.
+ */
+export class AcpContext {
+  /** @internal */
+  constructor(private readonly cx: ConnectionContext) {}
+
+  protected get connectionContext(): ConnectionContext {
+    return this.cx;
+  }
+
+  protected sendRequest<Req, Resp, Output = Resp>(
+    method: string,
+    params?: Req,
+    mapResponse?: (response: Resp) => Output,
+  ): Promise<Output> {
+    return this.cx.sendRequest(method, params, mapResponse);
+  }
+
+  protected sendNotification<N>(method: string, params?: N): Promise<void> {
+    return this.cx.sendNotification(method, params);
+  }
+
+  protected addDynamicHandler(handler: JsonRpcHandler): HandlerRegistration {
+    return this.cx.addDynamicHandler(handler);
+  }
+}
+
+/**
+ * Context passed to agent-side handlers.
+ *
+ * Agents use this context to call client-side ACP methods while handling
+ * requests such as `session/prompt`.
+ */
+export class AgentContext extends AcpContext {
+  /**
+   * Sends a request to the client by ACP method name.
+   *
+   * Built-in method literals infer their params and response types. Custom
+   * methods can specify their response and params types with generics.
+   */
+  request<Method extends ClientRequestMethod>(
+    method: Method,
+    params: ClientRequestParamsByMethod[Method],
+  ): Promise<ClientRequestResponsesByMethod[Method]>;
+  request<Response = unknown, Params = unknown>(
+    method: string,
+    params?: Params,
+  ): Promise<Response>;
+  request(method: string, params?: unknown): Promise<unknown> {
+    const spec = clientRequestSpecsByMethod[method] as
+      | AcpRequestSpec<unknown, unknown, unknown>
+      | undefined;
+    return this.sendRequest(method, params, spec?.mapResponse);
+  }
+
+  /**
+   * Sends a notification to the client by ACP method name.
+   *
+   * Built-in method literals infer their params type. Custom notifications can
+   * specify their params type with a generic.
+   */
+  notify<Method extends ClientNotificationMethod>(
+    method: Method,
+    params: ClientNotificationParamsByMethod[Method],
+  ): Promise<void>;
+  notify<Params = unknown>(method: string, params?: Params): Promise<void>;
+  notify(method: string, params?: unknown): Promise<void> {
+    return this.sendNotification(method, params);
+  }
+}
+
+/**
+ * Context used by clients to call agent-side ACP methods.
+ *
+ * `connectWith` passes a `ClientContext` to the callback. Client handlers also
+ * receive one as `c.agent` when they need to call back into the agent.
+ */
+export class ClientContext extends AcpContext {
+  /** @internal */
+  [startActiveSession](
+    params: schema.NewSessionRequest,
+  ): Promise<ActiveSession> {
+    return this.sendRequest<
+      schema.NewSessionRequest,
+      schema.NewSessionResponse,
+      ActiveSession
+    >(schema.AGENT_METHODS.session_new, params, (response) =>
+      this.attachSession(response),
+    );
+  }
+
+  /**
+   * Creates a builder for starting and observing an ACP session.
+   *
+   * Pass a string for the common case where only `cwd` is needed, or pass a
+   * full `NewSessionRequest` when you need MCP servers, `_meta`, or additional
+   * session fields.
+   */
+  buildSession(cwd: string): SessionBuilder;
+  buildSession(request: schema.NewSessionRequest): SessionBuilder;
+  buildSession(
+    cwdOrRequest: string | schema.NewSessionRequest,
+  ): SessionBuilder {
+    if (typeof cwdOrRequest === "string") {
+      return new SessionBuilder(this, { cwd: cwdOrRequest, mcpServers: [] });
+    }
+
+    return new SessionBuilder(this, cwdOrRequest);
+  }
+
+  /**
+   * Builds active-session helpers around a `session/new` response.
+   */
+  private attachSession(response: schema.NewSessionResponse): ActiveSession {
+    const updates = new AsyncQueue<ActiveSessionMessage>();
+    const closeSignal = this.connectionContext.signal;
+    const failUpdatesOnClose = () => {
+      updates.fail(closeSignal.reason ?? new Error("ACP connection closed"));
+    };
+    if (closeSignal.aborted) {
+      failUpdatesOnClose();
+    } else {
+      closeSignal.addEventListener("abort", failUpdatesOnClose);
+    }
+    const sessionRegistration = sessionUpdateRouter(
+      this.connectionContext,
+    ).attach(response, updates);
+    const closeRegistration = new HandlerRegistration(() => {
+      closeSignal.removeEventListener("abort", failUpdatesOnClose);
+    });
+
+    return new ActiveSession(this, response, updates, [
+      sessionRegistration,
+      closeRegistration,
+    ]);
+  }
+
+  /**
+   * Sends a request to the agent by ACP method name.
+   *
+   * Built-in method literals infer their params and response types. Custom
+   * methods can specify their response and params types with generics.
+   */
+  request<Method extends AgentRequestMethod>(
+    method: Method,
+    params: AgentRequestParamsByMethod[Method],
+  ): Promise<AgentRequestResponsesByMethod[Method]>;
+  request<Response = unknown, Params = unknown>(
+    method: string,
+    params?: Params,
+  ): Promise<Response>;
+  request(method: string, params?: unknown): Promise<unknown> {
+    const spec = agentRequestSpecsByMethod[method] as
+      | AcpRequestSpec<unknown, unknown, unknown>
+      | undefined;
+    return this.sendRequest(method, params, spec?.mapResponse);
+  }
+
+  /**
+   * Sends a notification to the agent by ACP method name.
+   *
+   * Built-in method literals infer their params type. Custom notifications can
+   * specify their params type with a generic.
+   */
+  notify<Method extends AgentNotificationMethod>(
+    method: Method,
+    params: AgentNotificationParamsByMethod[Method],
+  ): Promise<void>;
+  notify<Params = unknown>(method: string, params?: Params): Promise<void>;
+  notify(method: string, params?: unknown): Promise<void> {
+    return this.sendNotification(method, params);
+  }
+}
+
+type AsyncQueueEntry<T> =
+  | {
+      kind: "value";
+      value: T;
+    }
+  | {
+      kind: "error";
+      error: unknown;
+    };
+
+class AsyncQueue<T> {
+  private values: Array<AsyncQueueEntry<T>> = [];
+  private waiters: Array<{
+    resolve: (value: T) => void;
+    reject: (error: unknown) => void;
+  }> = [];
+  private failed = false;
+  private failure: unknown;
+
+  enqueue(value: T): void {
+    if (this.failed) {
+      return;
+    }
+
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter.resolve(value);
+    } else {
+      this.values.push({ kind: "value", value });
+    }
+  }
+
+  reject(error: unknown): void {
+    if (this.failed) {
+      return;
+    }
+
+    if (this.waiters.length > 0) {
+      for (const waiter of this.waiters.splice(0)) {
+        waiter.reject(error);
+      }
+      return;
+    }
+
+    this.values.push({ kind: "error", error });
+  }
+
+  clearErrors(): void {
+    this.values = this.values.filter((entry) => entry.kind === "value");
+  }
+
+  fail(error: unknown): void {
+    if (this.failed) {
+      return;
+    }
+
+    this.failed = true;
+    this.failure = error;
+    for (const waiter of this.waiters.splice(0)) {
+      waiter.reject(error);
+    }
+  }
+
+  next(): Promise<T> {
+    if (this.values.length > 0) {
+      const entry = this.values.shift() as AsyncQueueEntry<T>;
+      if (entry.kind === "error") {
+        return Promise.reject(entry.error);
+      }
+
+      return Promise.resolve(entry.value);
+    }
+
+    if (this.failed) {
+      return Promise.reject(this.failure);
+    }
+
+    return new Promise((resolve, reject) => {
+      this.waiters.push({ resolve, reject });
+    });
+  }
+}
+
+function cloneNewSessionRequest(
+  request: schema.NewSessionRequest,
+): schema.NewSessionRequest {
+  return {
+    ...request,
+    additionalDirectories: request.additionalDirectories
+      ? [...request.additionalDirectories]
+      : undefined,
+    mcpServers: [...request.mcpServers],
+  };
+}
+
+/**
+ * Message produced by an `ActiveSession`.
+ *
+ * `session_update` messages expose the typed `session/update` notification and
+ * `stop` messages report the final `session/prompt` response. A prompt turn is
+ * complete once a `stop` message is returned.
+ */
+export type ActiveSessionMessage =
+  | {
+      /**
+       * Indicates that this message came from a `session/update` notification.
+       */
+      kind: "session_update";
+      /**
+       * Full notification sent by the agent.
+       */
+      notification: schema.SessionNotification;
+      /**
+       * Convenience alias for `notification.update`.
+       */
+      update: schema.SessionUpdate;
+    }
+  | {
+      /**
+       * Indicates that the prompt turn has completed.
+       */
+      kind: "stop";
+      /**
+       * Final response from `session/prompt`.
+       */
+      response: schema.PromptResponse;
+      /**
+       * Convenience alias for `response.stopReason`.
+       */
+      stopReason: schema.StopReason;
+    };
+
+/**
+ * Builder for creating an `ActiveSession`.
+ *
+ * Start from `agent.buildSession("/absolute/cwd")` for the common case, or
+ * pass a full `NewSessionRequest` to `agent.buildSession(...)` when the session
+ * needs MCP servers, `_meta`, or additional request fields. All paths in ACP
+ * payloads should be absolute.
+ */
+export class SessionBuilder {
+  private request: schema.NewSessionRequest;
+
+  /** @internal */
+  constructor(
+    private cx: ClientContext,
+    request: schema.NewSessionRequest,
+  ) {
+    this.request = cloneNewSessionRequest(request);
+  }
+
+  /**
+   * Returns the `session/new` request that will be sent.
+   *
+   * The returned object is a defensive copy, so mutating it does not change the
+   * builder.
+   */
+  toRequest(): schema.NewSessionRequest {
+    return cloneNewSessionRequest(this.request);
+  }
+
+  /**
+   * Replaces the additional workspace roots for this session.
+   *
+   * `additionalDirectories` expand the session's file-system scope without
+   * changing `cwd`. Each path should be absolute.
+   */
+  withAdditionalDirectories(additionalDirectories: string[]): this {
+    this.request = {
+      ...this.request,
+      additionalDirectories: [...additionalDirectories],
+    };
+    return this;
+  }
+
+  /**
+   * Adds one MCP server to the `session/new` request.
+   */
+  withMcpServer(mcpServer: schema.McpServer): this {
+    this.request = {
+      ...this.request,
+      mcpServers: [...this.request.mcpServers, mcpServer],
+    };
+    return this;
+  }
+
+  /**
+   * Starts the session and returns an `ActiveSession` for prompting and reading
+   * updates.
+   *
+   * Call `dispose()` on the returned session when you no longer need update
+   * routing, or use `withSession(...)` to scope disposal automatically.
+   */
+  async start(): Promise<ActiveSession> {
+    return this.cx[startActiveSession](this.toRequest());
+  }
+
+  /**
+   * Starts the session, runs `op`, and disposes the active-session update
+   * routing when `op` finishes or throws.
+   */
+  async withSession<T>(
+    op: (session: ActiveSession) => MaybePromise<T>,
+  ): Promise<T> {
+    const session = await this.start();
+    try {
+      return await op(session);
+    } finally {
+      session.dispose();
+    }
+  }
+}
+
+/**
+ * Convenience wrapper for an active ACP session.
+ *
+ * An active session routes `session/update` notifications for one session ID
+ * into an async queue. Use `prompt(...)` to send user content, then read updates
+ * with `nextUpdate()` until a `stop` message is returned.
+ */
+export class ActiveSession {
+  /** @internal */
+  constructor(
+    private cx: ClientContext,
+    private sessionResponse: schema.NewSessionResponse,
+    private updates: {
+      enqueue(value: ActiveSessionMessage): void;
+      reject(error: unknown): void;
+      clearErrors(): void;
+      fail(error: unknown): void;
+      next(): Promise<ActiveSessionMessage>;
+    },
+    private registrations: HandlerRegistration[],
+  ) {}
+
+  /**
+   * Session ID returned by `session/new`.
+   */
+  get sessionId(): schema.SessionId {
+    return this.sessionResponse.sessionId;
+  }
+
+  /**
+   * Mode state returned when the session was created, if the agent provided it.
+   */
+  get modes(): schema.SessionModeState | null | undefined {
+    return this.sessionResponse.modes;
+  }
+
+  /**
+   * Metadata returned when the session was created.
+   */
+  get meta(): { [key: string]: unknown } | null | undefined {
+    return this.sessionResponse._meta;
+  }
+
+  /**
+   * Full response returned by `session/new`.
+   */
+  get newSessionResponse(): schema.NewSessionResponse {
+    return this.sessionResponse;
+  }
+
+  /**
+   * Sends a prompt to this session.
+   *
+   * Strings are converted to one text content block. A single content block is
+   * wrapped in an array. The returned promise resolves with the final
+   * `PromptResponse`, and the same completion is also queued as a `stop`
+   * message for `nextUpdate()`.
+   */
+  prompt(
+    prompt: string | schema.ContentBlock | Array<schema.ContentBlock>,
+  ): Promise<schema.PromptResponse> {
+    this.updates.clearErrors();
+    const response = this.cx.request(schema.AGENT_METHODS.session_prompt, {
+      sessionId: this.sessionId,
+      prompt: this.promptBlocks(prompt),
+    });
+    void response.then(
+      (value) => {
+        this.updates.enqueue({
+          kind: "stop",
+          response: value,
+          stopReason: value.stopReason,
+        });
+      },
+      (error) => {
+        this.updates.reject(error);
+      },
+    );
+    return response;
+  }
+
+  /**
+   * Reads the next update or stop message for this session.
+   */
+  nextUpdate(): Promise<ActiveSessionMessage> {
+    return this.updates.next();
+  }
+
+  /**
+   * Reads text chunks until the current prompt turn stops.
+   *
+   * Only `agent_message_chunk` updates with text content are appended. Other
+   * update types are ignored by this helper; use `nextUpdate()` when you need
+   * tool calls, plans, or the final `PromptResponse`.
+   */
+  async readText(): Promise<string> {
+    let output = "";
+    for (;;) {
+      const message = await this.nextUpdate();
+      if (message.kind === "stop") {
+        return output;
+      }
+
+      const { update } = message;
+      if (
+        update.sessionUpdate === "agent_message_chunk" &&
+        update.content.type === "text"
+      ) {
+        output += update.content.text;
+      }
+    }
+  }
+
+  /**
+   * Stops routing updates to this active-session helper.
+   *
+   * This does not close the ACP session on the agent. Use `ClientContext`
+   * session lifecycle methods when the protocol session itself should be closed
+   * or deleted.
+   */
+  dispose(): void {
+    for (const registration of this.registrations.splice(0)) {
+      registration.dispose();
+    }
+    this.updates.fail(new Error("Active session disposed"));
+  }
+
+  /**
+   * Supports explicit resource management with `using`.
+   */
+  [Symbol.dispose](): void {
+    this.dispose();
+  }
+
+  private promptBlocks(
+    prompt: string | schema.ContentBlock | Array<schema.ContentBlock>,
+  ): Array<schema.ContentBlock> {
+    if (typeof prompt === "string") {
+      return [{ type: "text", text: prompt }];
+    }
+
+    if (Array.isArray(prompt)) {
+      return prompt;
+    }
+
+    return [prompt];
+  }
+}
+
+/**
+ * Options used when creating an ACP app.
+ */
+export type AppOptions = {
+  /**
+   * Human-readable name used in JSON-RPC handler descriptions and diagnostics.
+   */
+  name?: string;
+};
+
+/**
+ * Parser used by custom methods to validate or transform raw JSON-RPC params.
+ *
+ * A Zod schema can be passed directly because schemas expose a compatible
+ * `parse(...)` method.
+ */
+export type ParamsParser<Params> =
+  | {
+      /**
+       * Parses raw JSON-RPC params into the handler's typed params.
+       */
+      parse: (params: unknown) => Params;
+    }
+  | ((params: unknown) => Params);
+
+/**
+ * Context passed to agent-side request and notification handlers.
+ */
+export type AgentHandlerContext<Params> = {
+  /**
+   * Parsed request or notification params.
+   */
+  params: Params;
+  /**
+   * Typed client context for calling client-side ACP methods.
+   */
+  client: AgentContext;
+};
+
+/**
+ * Context passed to client-side request and notification handlers.
+ */
+export type ClientHandlerContext<Params> = {
+  /**
+   * Parsed request or notification params.
+   */
+  params: Params;
+  /**
+   * Typed agent context for calling agent-side ACP methods.
+   */
+  agent: ClientContext;
+};
+
+/**
+ * Request handler registered on an `AgentApp`.
+ */
+export type AgentRequestHandler<Params, Response> = (
+  context: AgentHandlerContext<Params>,
+) => MaybePromise<Response>;
+
+/**
+ * Notification handler registered on an `AgentApp`.
+ */
+export type AgentNotificationHandler<Params> = (
+  context: AgentHandlerContext<Params>,
+) => MaybePromise<void>;
+
+/**
+ * Request handler registered on a `ClientApp`.
+ */
+export type ClientRequestHandler<Params, Response> = (
+  context: ClientHandlerContext<Params>,
+) => MaybePromise<Response>;
+
+/**
+ * Notification handler registered on a `ClientApp`.
+ */
+export type ClientNotificationHandler<Params> = (
+  context: ClientHandlerContext<Params>,
+) => MaybePromise<void>;
+
+function parseParams<Params>(
+  parser: ParamsParser<Params> | undefined,
+  params: unknown,
+): Params {
+  if (!parser) {
+    return params as Params;
+  }
+
+  if (typeof parser === "function") {
+    return parser(params);
+  }
+
+  return parser.parse(params);
+}
+
+type AcpRequestSpec<Params, Response, WireResponse = Response> = {
+  method: string;
+  params?: ParamsParser<Params>;
+  mapResponse?: (response: Response) => WireResponse;
+};
+
+type AcpNotificationSpec<Params> = {
+  method: string;
+  params?: ParamsParser<Params>;
+};
+
+function requestSpec<Params, Response, WireResponse = Response>(
+  method: string,
+  params: ParamsParser<Params>,
+  mapResponse?: (response: Response) => WireResponse,
+): AcpRequestSpec<Params, Response, WireResponse> {
+  return { method, params, mapResponse };
+}
+
+function notificationSpec<Params>(
+  method: string,
+  params: ParamsParser<Params>,
+): AcpNotificationSpec<Params> {
+  return { method, params };
+}
+
+function registerAppRequest<Params, Response, WireResponse, Context>(
+  builder: ConnectionBuilder,
+  spec: AcpRequestSpec<Params, Response, WireResponse>,
+  context: (params: Params, cx: ConnectionContext) => Context,
+  handler: (context: Context) => MaybePromise<Response>,
+): void {
+  builder.onReceiveRequest<Params, WireResponse>(
+    spec.method,
+    (params) => parseParams(spec.params, params),
+    async (params, responder, cx) => {
+      const response = await handler(context(params, cx));
+      await responder.respond(
+        (spec.mapResponse
+          ? spec.mapResponse(response)
+          : response) as WireResponse,
+      );
+    },
+  );
+}
+
+function registerAppNotification<Params, Context>(
+  builder: ConnectionBuilder,
+  spec: AcpNotificationSpec<Params>,
+  context: (params: Params, cx: ConnectionContext) => Context,
+  handler: (context: Context) => MaybePromise<void>,
+): void {
+  builder.onReceiveNotification(
+    spec.method,
+    (params) => parseParams(spec.params, params),
+    (params, cx) => handler(context(params, cx)),
+  );
+}
+
+function specsByMethod<T extends Record<string, { method: string }>>(
+  specs: T,
+): Record<string, T[keyof T]> {
+  const byMethod: Record<string, T[keyof T]> = {};
+  for (const spec of Object.values(specs) as Array<T[keyof T]>) {
+    byMethod[spec.method] = spec;
+  }
+  return byMethod;
+}
+
+const agentRequestSpecs = {
+  initialize: requestSpec<schema.InitializeRequest, schema.InitializeResponse>(
+    schema.AGENT_METHODS.initialize,
+    validate.zInitializeRequest,
+  ),
+  newSession: requestSpec<schema.NewSessionRequest, schema.NewSessionResponse>(
+    schema.AGENT_METHODS.session_new,
+    validate.zNewSessionRequest,
+  ),
+  loadSession: requestSpec<
+    schema.LoadSessionRequest,
+    schema.LoadSessionResponse | void,
+    schema.LoadSessionResponse
+  >(
+    schema.AGENT_METHODS.session_load,
+    validate.zLoadSessionRequest,
+    emptyObjectResponse,
+  ),
+  unstable_forkSession: requestSpec<
+    schema.ForkSessionRequest,
+    schema.ForkSessionResponse
+  >(schema.AGENT_METHODS.session_fork, validate.zForkSessionRequest),
+  listSessions: requestSpec<
+    schema.ListSessionsRequest,
+    schema.ListSessionsResponse
+  >(schema.AGENT_METHODS.session_list, validate.zListSessionsRequest),
+  deleteSession: requestSpec<
+    schema.DeleteSessionRequest,
+    schema.DeleteSessionResponse | void,
+    schema.DeleteSessionResponse
+  >(
+    schema.AGENT_METHODS.session_delete,
+    validate.zDeleteSessionRequest,
+    emptyObjectResponse,
+  ),
+  resumeSession: requestSpec<
+    schema.ResumeSessionRequest,
+    schema.ResumeSessionResponse
+  >(schema.AGENT_METHODS.session_resume, validate.zResumeSessionRequest),
+  closeSession: requestSpec<
+    schema.CloseSessionRequest,
+    schema.CloseSessionResponse | void,
+    schema.CloseSessionResponse
+  >(
+    schema.AGENT_METHODS.session_close,
+    validate.zCloseSessionRequest,
+    emptyObjectResponse,
+  ),
+  setSessionMode: requestSpec<
+    schema.SetSessionModeRequest,
+    schema.SetSessionModeResponse | void,
+    schema.SetSessionModeResponse
+  >(
+    schema.AGENT_METHODS.session_set_mode,
+    validate.zSetSessionModeRequest,
+    emptyObjectResponse,
+  ),
+  setSessionConfigOption: requestSpec<
+    schema.SetSessionConfigOptionRequest,
+    schema.SetSessionConfigOptionResponse
+  >(
+    schema.AGENT_METHODS.session_set_config_option,
+    validate.zSetSessionConfigOptionRequest,
+  ),
+  authenticate: requestSpec<
+    schema.AuthenticateRequest,
+    schema.AuthenticateResponse | void,
+    schema.AuthenticateResponse
+  >(
+    schema.AGENT_METHODS.authenticate,
+    validate.zAuthenticateRequest,
+    emptyObjectResponse,
+  ),
+  unstable_listProviders: requestSpec<
+    schema.ListProvidersRequest,
+    schema.ListProvidersResponse
+  >(schema.AGENT_METHODS.providers_list, validate.zListProvidersRequest),
+  unstable_setProvider: requestSpec<
+    schema.SetProviderRequest,
+    schema.SetProviderResponse | void,
+    schema.SetProviderResponse
+  >(
+    schema.AGENT_METHODS.providers_set,
+    validate.zSetProviderRequest,
+    emptyObjectResponse,
+  ),
+  unstable_disableProvider: requestSpec<
+    schema.DisableProviderRequest,
+    schema.DisableProviderResponse | void,
+    schema.DisableProviderResponse
+  >(
+    schema.AGENT_METHODS.providers_disable,
+    validate.zDisableProviderRequest,
+    emptyObjectResponse,
+  ),
+  logout: requestSpec<
+    schema.LogoutRequest,
+    schema.LogoutResponse | void,
+    schema.LogoutResponse
+  >(schema.AGENT_METHODS.logout, validate.zLogoutRequest, emptyObjectResponse),
+  prompt: requestSpec<schema.PromptRequest, schema.PromptResponse>(
+    schema.AGENT_METHODS.session_prompt,
+    validate.zPromptRequest,
+  ),
+  unstable_startNes: requestSpec<
+    schema.StartNesRequest,
+    schema.StartNesResponse
+  >(schema.AGENT_METHODS.nes_start, validate.zStartNesRequest),
+  unstable_suggestNes: requestSpec<
+    schema.SuggestNesRequest,
+    schema.SuggestNesResponse
+  >(schema.AGENT_METHODS.nes_suggest, validate.zSuggestNesRequest),
+  unstable_closeNes: requestSpec<
+    schema.CloseNesRequest,
+    schema.CloseNesResponse | void,
+    schema.CloseNesResponse
+  >(
+    schema.AGENT_METHODS.nes_close,
+    validate.zCloseNesRequest,
+    emptyObjectResponse,
+  ),
+};
+
+const agentNotificationSpecs = {
+  cancel: notificationSpec<schema.CancelNotification>(
+    schema.AGENT_METHODS.session_cancel,
+    validate.zCancelNotification,
+  ),
+  unstable_didOpenDocument:
+    notificationSpec<schema.DidOpenDocumentNotification>(
+      schema.AGENT_METHODS.document_did_open,
+      validate.zDidOpenDocumentNotification,
+    ),
+  unstable_didChangeDocument:
+    notificationSpec<schema.DidChangeDocumentNotification>(
+      schema.AGENT_METHODS.document_did_change,
+      validate.zDidChangeDocumentNotification,
+    ),
+  unstable_didCloseDocument:
+    notificationSpec<schema.DidCloseDocumentNotification>(
+      schema.AGENT_METHODS.document_did_close,
+      validate.zDidCloseDocumentNotification,
+    ),
+  unstable_didSaveDocument:
+    notificationSpec<schema.DidSaveDocumentNotification>(
+      schema.AGENT_METHODS.document_did_save,
+      validate.zDidSaveDocumentNotification,
+    ),
+  unstable_didFocusDocument:
+    notificationSpec<schema.DidFocusDocumentNotification>(
+      schema.AGENT_METHODS.document_did_focus,
+      validate.zDidFocusDocumentNotification,
+    ),
+  unstable_acceptNes: notificationSpec<schema.AcceptNesNotification>(
+    schema.AGENT_METHODS.nes_accept,
+    validate.zAcceptNesNotification,
+  ),
+  unstable_rejectNes: notificationSpec<schema.RejectNesNotification>(
+    schema.AGENT_METHODS.nes_reject,
+    validate.zRejectNesNotification,
+  ),
+};
+
+const clientRequestSpecs = {
+  requestPermission: requestSpec<
+    schema.RequestPermissionRequest,
+    schema.RequestPermissionResponse
+  >(
+    schema.CLIENT_METHODS.session_request_permission,
+    validate.zRequestPermissionRequest,
+  ),
+  writeTextFile: requestSpec<
+    schema.WriteTextFileRequest,
+    schema.WriteTextFileResponse | void,
+    schema.WriteTextFileResponse
+  >(
+    schema.CLIENT_METHODS.fs_write_text_file,
+    validate.zWriteTextFileRequest,
+    emptyObjectResponse,
+  ),
+  readTextFile: requestSpec<
+    schema.ReadTextFileRequest,
+    schema.ReadTextFileResponse
+  >(schema.CLIENT_METHODS.fs_read_text_file, validate.zReadTextFileRequest),
+  createTerminal: requestSpec<
+    schema.CreateTerminalRequest,
+    schema.CreateTerminalResponse
+  >(schema.CLIENT_METHODS.terminal_create, validate.zCreateTerminalRequest),
+  terminalOutput: requestSpec<
+    schema.TerminalOutputRequest,
+    schema.TerminalOutputResponse
+  >(schema.CLIENT_METHODS.terminal_output, validate.zTerminalOutputRequest),
+  releaseTerminal: requestSpec<
+    schema.ReleaseTerminalRequest,
+    schema.ReleaseTerminalResponse | void,
+    schema.ReleaseTerminalResponse
+  >(
+    schema.CLIENT_METHODS.terminal_release,
+    validate.zReleaseTerminalRequest,
+    emptyObjectResponse,
+  ),
+  waitForTerminalExit: requestSpec<
+    schema.WaitForTerminalExitRequest,
+    schema.WaitForTerminalExitResponse
+  >(
+    schema.CLIENT_METHODS.terminal_wait_for_exit,
+    validate.zWaitForTerminalExitRequest,
+  ),
+  killTerminal: requestSpec<
+    schema.KillTerminalRequest,
+    schema.KillTerminalResponse | void,
+    schema.KillTerminalResponse
+  >(
+    schema.CLIENT_METHODS.terminal_kill,
+    validate.zKillTerminalRequest,
+    emptyObjectResponse,
+  ),
+  unstable_createElicitation: requestSpec<
+    schema.CreateElicitationRequest,
+    schema.CreateElicitationResponse
+  >(
+    schema.CLIENT_METHODS.elicitation_create,
+    validate.zCreateElicitationRequest,
+  ),
+};
+
+const clientNotificationSpecs = {
+  sessionUpdate: notificationSpec<schema.SessionNotification>(
+    schema.CLIENT_METHODS.session_update,
+    validate.zSessionNotification,
+  ),
+  unstable_completeElicitation:
+    notificationSpec<schema.CompleteElicitationNotification>(
+      schema.CLIENT_METHODS.elicitation_complete,
+      validate.zCompleteElicitationNotification,
+    ),
+};
+
+const agentRequestSpecsByMethod = specsByMethod(agentRequestSpecs);
+const agentNotificationSpecsByMethod = specsByMethod(agentNotificationSpecs);
+const clientRequestSpecsByMethod = specsByMethod(clientRequestSpecs);
+const clientNotificationSpecsByMethod = specsByMethod(clientNotificationSpecs);
+
+/**
+ * Agent request handlers keyed by ACP protocol method name.
+ */
+export type AgentRequestHandlersByMethod = {
+  [schema.AGENT_METHODS.initialize]: AgentRequestHandler<
+    schema.InitializeRequest,
+    schema.InitializeResponse
+  >;
+  [schema.AGENT_METHODS.session_new]: AgentRequestHandler<
+    schema.NewSessionRequest,
+    schema.NewSessionResponse
+  >;
+  [schema.AGENT_METHODS.session_load]: AgentRequestHandler<
+    schema.LoadSessionRequest,
+    schema.LoadSessionResponse | void
+  >;
+  [schema.AGENT_METHODS.session_fork]: AgentRequestHandler<
+    schema.ForkSessionRequest,
+    schema.ForkSessionResponse
+  >;
+  [schema.AGENT_METHODS.session_list]: AgentRequestHandler<
+    schema.ListSessionsRequest,
+    schema.ListSessionsResponse
+  >;
+  [schema.AGENT_METHODS.session_delete]: AgentRequestHandler<
+    schema.DeleteSessionRequest,
+    schema.DeleteSessionResponse | void
+  >;
+  [schema.AGENT_METHODS.session_resume]: AgentRequestHandler<
+    schema.ResumeSessionRequest,
+    schema.ResumeSessionResponse
+  >;
+  [schema.AGENT_METHODS.session_close]: AgentRequestHandler<
+    schema.CloseSessionRequest,
+    schema.CloseSessionResponse | void
+  >;
+  [schema.AGENT_METHODS.session_set_mode]: AgentRequestHandler<
+    schema.SetSessionModeRequest,
+    schema.SetSessionModeResponse | void
+  >;
+  [schema.AGENT_METHODS.session_set_config_option]: AgentRequestHandler<
+    schema.SetSessionConfigOptionRequest,
+    schema.SetSessionConfigOptionResponse
+  >;
+  [schema.AGENT_METHODS.authenticate]: AgentRequestHandler<
+    schema.AuthenticateRequest,
+    schema.AuthenticateResponse | void
+  >;
+  [schema.AGENT_METHODS.providers_list]: AgentRequestHandler<
+    schema.ListProvidersRequest,
+    schema.ListProvidersResponse
+  >;
+  [schema.AGENT_METHODS.providers_set]: AgentRequestHandler<
+    schema.SetProviderRequest,
+    schema.SetProviderResponse | void
+  >;
+  [schema.AGENT_METHODS.providers_disable]: AgentRequestHandler<
+    schema.DisableProviderRequest,
+    schema.DisableProviderResponse | void
+  >;
+  [schema.AGENT_METHODS.logout]: AgentRequestHandler<
+    schema.LogoutRequest,
+    schema.LogoutResponse | void
+  >;
+  [schema.AGENT_METHODS.session_prompt]: AgentRequestHandler<
+    schema.PromptRequest,
+    schema.PromptResponse
+  >;
+  [schema.AGENT_METHODS.nes_start]: AgentRequestHandler<
+    schema.StartNesRequest,
+    schema.StartNesResponse
+  >;
+  [schema.AGENT_METHODS.nes_suggest]: AgentRequestHandler<
+    schema.SuggestNesRequest,
+    schema.SuggestNesResponse
+  >;
+  [schema.AGENT_METHODS.nes_close]: AgentRequestHandler<
+    schema.CloseNesRequest,
+    schema.CloseNesResponse | void
+  >;
+};
+
+/**
+ * ACP request methods that can be handled by an `AgentApp`.
+ */
+export type AgentRequestMethod = keyof AgentRequestHandlersByMethod & string;
+
+/**
+ * Agent notification handlers keyed by ACP protocol method name.
+ */
+export type AgentNotificationHandlersByMethod = {
+  [schema.AGENT_METHODS
+    .session_cancel]: AgentNotificationHandler<schema.CancelNotification>;
+  [schema.AGENT_METHODS
+    .document_did_open]: AgentNotificationHandler<schema.DidOpenDocumentNotification>;
+  [schema.AGENT_METHODS
+    .document_did_change]: AgentNotificationHandler<schema.DidChangeDocumentNotification>;
+  [schema.AGENT_METHODS
+    .document_did_close]: AgentNotificationHandler<schema.DidCloseDocumentNotification>;
+  [schema.AGENT_METHODS
+    .document_did_save]: AgentNotificationHandler<schema.DidSaveDocumentNotification>;
+  [schema.AGENT_METHODS
+    .document_did_focus]: AgentNotificationHandler<schema.DidFocusDocumentNotification>;
+  [schema.AGENT_METHODS
+    .nes_accept]: AgentNotificationHandler<schema.AcceptNesNotification>;
+  [schema.AGENT_METHODS
+    .nes_reject]: AgentNotificationHandler<schema.RejectNesNotification>;
+};
+
+/**
+ * ACP notification methods that can be handled by an `AgentApp`.
+ */
+export type AgentNotificationMethod = keyof AgentNotificationHandlersByMethod &
+  string;
+
+/**
+ * Client request handlers keyed by ACP protocol method name.
+ */
+export type ClientRequestHandlersByMethod = {
+  [schema.CLIENT_METHODS.session_request_permission]: ClientRequestHandler<
+    schema.RequestPermissionRequest,
+    schema.RequestPermissionResponse
+  >;
+  [schema.CLIENT_METHODS.fs_write_text_file]: ClientRequestHandler<
+    schema.WriteTextFileRequest,
+    schema.WriteTextFileResponse | void
+  >;
+  [schema.CLIENT_METHODS.fs_read_text_file]: ClientRequestHandler<
+    schema.ReadTextFileRequest,
+    schema.ReadTextFileResponse
+  >;
+  [schema.CLIENT_METHODS.terminal_create]: ClientRequestHandler<
+    schema.CreateTerminalRequest,
+    schema.CreateTerminalResponse
+  >;
+  [schema.CLIENT_METHODS.terminal_output]: ClientRequestHandler<
+    schema.TerminalOutputRequest,
+    schema.TerminalOutputResponse
+  >;
+  [schema.CLIENT_METHODS.terminal_release]: ClientRequestHandler<
+    schema.ReleaseTerminalRequest,
+    schema.ReleaseTerminalResponse | void
+  >;
+  [schema.CLIENT_METHODS.terminal_wait_for_exit]: ClientRequestHandler<
+    schema.WaitForTerminalExitRequest,
+    schema.WaitForTerminalExitResponse
+  >;
+  [schema.CLIENT_METHODS.terminal_kill]: ClientRequestHandler<
+    schema.KillTerminalRequest,
+    schema.KillTerminalResponse | void
+  >;
+  [schema.CLIENT_METHODS.elicitation_create]: ClientRequestHandler<
+    schema.CreateElicitationRequest,
+    schema.CreateElicitationResponse
+  >;
+};
+
+/**
+ * ACP request methods that can be handled by a `ClientApp`.
+ */
+export type ClientRequestMethod = keyof ClientRequestHandlersByMethod & string;
+
+/**
+ * Client notification handlers keyed by ACP protocol method name.
+ */
+export type ClientNotificationHandlersByMethod = {
+  [schema.CLIENT_METHODS
+    .session_update]: ClientNotificationHandler<schema.SessionNotification>;
+  [schema.CLIENT_METHODS
+    .elicitation_complete]: ClientNotificationHandler<schema.CompleteElicitationNotification>;
+};
+
+/**
+ * ACP notification methods that can be handled by a `ClientApp`.
+ */
+export type ClientNotificationMethod =
+  keyof ClientNotificationHandlersByMethod & string;
+
+/**
+ * Agent request params keyed by ACP protocol method name.
+ */
+export type AgentRequestParamsByMethod = {
+  [Method in AgentRequestMethod]: AgentRequestHandlersByMethod[Method] extends (
+    context: infer Context,
+  ) => MaybePromise<unknown>
+    ? Context extends { params: infer Params }
+      ? Params
+      : never
+    : never;
+};
+
+/**
+ * Agent request responses keyed by ACP protocol method name.
+ */
+export type AgentRequestResponsesByMethod = {
+  [Method in AgentRequestMethod]: AgentRequestHandlersByMethod[Method] extends (
+    context: infer _Context,
+  ) => MaybePromise<infer Response>
+    ? Exclude<Response, void>
+    : never;
+};
+
+/**
+ * Agent notification params keyed by ACP protocol method name.
+ */
+export type AgentNotificationParamsByMethod = {
+  [Method in AgentNotificationMethod]: AgentNotificationHandlersByMethod[Method] extends (
+    context: infer Context,
+  ) => MaybePromise<void>
+    ? Context extends { params: infer Params }
+      ? Params
+      : never
+    : never;
+};
+
+/**
+ * Client request params keyed by ACP protocol method name.
+ */
+export type ClientRequestParamsByMethod = {
+  [Method in ClientRequestMethod]: ClientRequestHandlersByMethod[Method] extends (
+    context: infer Context,
+  ) => MaybePromise<unknown>
+    ? Context extends { params: infer Params }
+      ? Params
+      : never
+    : never;
+};
+
+/**
+ * Client request responses keyed by ACP protocol method name.
+ */
+export type ClientRequestResponsesByMethod = {
+  [Method in ClientRequestMethod]: ClientRequestHandlersByMethod[Method] extends (
+    context: infer _Context,
+  ) => MaybePromise<infer Response>
+    ? Exclude<Response, void>
+    : never;
+};
+
+/**
+ * Client notification params keyed by ACP protocol method name.
+ */
+export type ClientNotificationParamsByMethod = {
+  [Method in ClientNotificationMethod]: ClientNotificationHandlersByMethod[Method] extends (
+    context: infer Context,
+  ) => MaybePromise<void>
+    ? Context extends { params: infer Params }
+      ? Params
+      : never
+    : never;
+};
+
+function agentHandlerContext<Params>(
+  params: Params,
+  client: AgentContext,
+): AgentHandlerContext<Params> {
+  return {
+    params,
+    client,
+  };
+}
+
+function clientHandlerContext<Params>(
+  params: Params,
+  agent: ClientContext,
+): ClientHandlerContext<Params> {
+  return {
+    params,
+    agent,
+  };
+}
+
+type ActiveSessionUpdateQueue = {
+  enqueue(value: ActiveSessionMessage): void;
+};
+
+class SessionUpdateRouter {
+  private readonly activeSessions = new Map<
+    string,
+    Set<ActiveSessionUpdateQueue>
+  >();
+
+  handleMessage(message: IncomingMessage): HandleResult {
+    if (
+      message.kind !== "notification" ||
+      message.method !== schema.CLIENT_METHODS.session_update
+    ) {
+      return Handled.no(message);
+    }
+
+    const notification = validate.zSessionNotification.parse(message.params);
+    const update = {
+      kind: "session_update",
+      notification,
+      update: notification.update,
+    } satisfies ActiveSessionMessage;
+    const activeSessions = this.activeSessions.get(notification.sessionId);
+    if (activeSessions && activeSessions.size > 0) {
+      for (const session of activeSessions) {
+        session.enqueue(update);
+      }
+    }
+
+    return Handled.no(message);
+  }
+
+  attach(
+    response: schema.NewSessionResponse,
+    updates: ActiveSessionUpdateQueue,
+  ): HandlerRegistration {
+    const sessions =
+      this.activeSessions.get(response.sessionId) ??
+      new Set<ActiveSessionUpdateQueue>();
+    sessions.add(updates);
+    this.activeSessions.set(response.sessionId, sessions);
+
+    return new HandlerRegistration(() => {
+      sessions.delete(updates);
+      if (sessions.size === 0) {
+        this.activeSessions.delete(response.sessionId);
+      }
+    });
+  }
+}
+
+const sessionUpdateRouters = new WeakMap<
+  ConnectionContext,
+  SessionUpdateRouter
+>();
+
+function sessionUpdateRouter(cx: ConnectionContext): SessionUpdateRouter {
+  let router = sessionUpdateRouters.get(cx);
+  if (!router) {
+    router = new SessionUpdateRouter();
+    sessionUpdateRouters.set(cx, router);
+  }
+  return router;
+}
+
+const appBuilder = Symbol("appBuilder");
+
+/**
+ * Creates an agent-side app.
+ *
+ * Register request and notification handlers by ACP method name, then call
+ * `connect(stream)` to serve an ACP client.
+ */
+export function agent(options?: AppOptions): AgentApp {
+  return new AgentApp(options);
+}
+
+/**
+ * Agent-side app builder.
+ *
+ * Methods on this class register typed request or notification handlers and
+ * return `this`, so apps can be built with a fluent chain. Handler params are
+ * parsed with the generated ACP schemas before your handler runs, and thrown
+ * errors are converted to JSON-RPC errors by the connection layer.
+ */
+export class AgentApp {
+  private readonly builder = Connection.builder();
+
+  constructor(options: AppOptions = {}) {
+    if (options.name) {
+      this.builder.name(options.name);
+    }
+  }
+
+  /** @internal */
+  [appBuilder](): ConnectionBuilder {
+    return this.builder;
+  }
+
+  /**
+   * Connects this agent app to a transport stream.
+   */
+  connect(stream: Stream): Connection;
+  /**
+   * Connects this agent app directly to a client app.
+   *
+   * This is useful for tests and in-process examples that do not need a
+   * transport.
+   */
+  connect(client: ClientApp): Connection;
+  connect(target: Stream | ClientApp): Connection {
+    return this.connectTarget(target);
+  }
+
+  /**
+   * Connects this agent app to a transport stream for the lifetime of `op`.
+   *
+   * The callback receives an `AgentContext` for calling client-side methods.
+   * When `op` resolves or rejects, the connection is closed.
+   */
+  connectWith<T>(
+    stream: Stream,
+    op: (context: AgentContext) => MaybePromise<T>,
+  ): Promise<T>;
+  /**
+   * Connects this agent app directly to a client app for the lifetime of `op`.
+   */
+  connectWith<T>(
+    client: ClientApp,
+    op: (context: AgentContext) => MaybePromise<T>,
+  ): Promise<T>;
+  connectWith<T>(
+    target: Stream | ClientApp,
+    op: (context: AgentContext) => MaybePromise<T>,
+  ): Promise<T> {
+    return this.connectTarget(target).runUntil((cx) =>
+      op(new AgentContext(cx)),
+    );
+  }
+
+  /**
+   * Registers a request handler by ACP method name.
+   *
+   * Built-in method literals infer their params and response types from
+   * `method`. Pass a parser as the second argument to register custom extension
+   * methods.
+   */
+  onRequest<Method extends AgentRequestMethod>(
+    method: Method,
+    handler: AgentRequestHandlersByMethod[Method],
+  ): this;
+  onRequest<Params, Response>(
+    method: string,
+    params: ParamsParser<Params>,
+    handler: AgentRequestHandler<Params, Response>,
+  ): this;
+  onRequest<Params, Response>(
+    method: string,
+    handlerOrParams:
+      | AgentRequestHandlersByMethod[AgentRequestMethod]
+      | ParamsParser<Params>,
+    handler?: AgentRequestHandler<Params, Response>,
+  ): this {
+    if (handler) {
+      return this.request(
+        { method, params: handlerOrParams as ParamsParser<Params> },
+        handler,
+      );
+    }
+
+    const spec = agentRequestSpecsByMethod[method];
+    if (!spec) {
+      throw new Error(
+        `Unknown ACP request method '${method}'. Pass a params parser for custom methods.`,
+      );
+    }
+
+    return this.request(
+      spec as AcpRequestSpec<unknown, unknown, unknown>,
+      handlerOrParams as AgentRequestHandler<unknown, unknown>,
+    );
+  }
+
+  /**
+   * Registers a notification handler by ACP method name.
+   *
+   * Built-in method literals infer their params type from `method`. Pass a
+   * parser as the second argument to register custom extension notifications.
+   */
+  onNotification<Method extends AgentNotificationMethod>(
+    method: Method,
+    handler: AgentNotificationHandlersByMethod[Method],
+  ): this;
+  onNotification<Params>(
+    method: string,
+    params: ParamsParser<Params>,
+    handler: AgentNotificationHandler<Params>,
+  ): this;
+  onNotification<Params>(
+    method: string,
+    handlerOrParams:
+      | AgentNotificationHandlersByMethod[AgentNotificationMethod]
+      | ParamsParser<Params>,
+    handler?: AgentNotificationHandler<Params>,
+  ): this {
+    if (handler) {
+      return this.notification(
+        { method, params: handlerOrParams as ParamsParser<Params> },
+        handler,
+      );
+    }
+
+    const spec = agentNotificationSpecsByMethod[method];
+    if (!spec) {
+      throw new Error(
+        `Unknown ACP notification method '${method}'. Pass a params parser for custom methods.`,
+      );
+    }
+
+    return this.notification(
+      spec as AcpNotificationSpec<unknown>,
+      handlerOrParams as AgentNotificationHandler<unknown>,
+    );
+  }
+
+  private request<Params, Response, WireResponse = Response>(
+    spec: AcpRequestSpec<Params, Response, WireResponse>,
+    handler: AgentRequestHandler<Params, Response>,
+  ): this {
+    registerAppRequest(
+      this.builder,
+      spec,
+      (params, cx) => agentHandlerContext(params, new AgentContext(cx)),
+      handler,
+    );
+    return this;
+  }
+
+  private notification<Params>(
+    spec: AcpNotificationSpec<Params>,
+    handler: AgentNotificationHandler<Params>,
+  ): this {
+    registerAppNotification(
+      this.builder,
+      spec,
+      (params, cx) => agentHandlerContext(params, new AgentContext(cx)),
+      handler,
+    );
+    return this;
+  }
+
+  private connectTarget(target: Stream | ClientApp): Connection {
+    if (isStream(target)) {
+      return this.builder.connect(target);
+    }
+
+    return connectInProcess(
+      (stream) => this.builder.connect(stream),
+      (stream) => target.connect(stream),
+    );
+  }
+}
+
+/**
+ * Creates a client-side app.
+ *
+ * Register request and notification handlers by ACP method name, then use
+ * `connectWith(...)` to run the workflow that calls agent-side methods.
+ */
+export function client(options?: AppOptions): ClientApp {
+  return new ClientApp(options);
+}
+
+/**
+ * Client-side app builder.
+ *
+ * Methods on this class register typed client handlers and return `this`, so
+ * apps can be built with a fluent chain. `connectWith(...)` is the usual entry
+ * point for clients because it provides a `ClientContext` for calling
+ * agent-side requests and session helpers.
+ */
+export class ClientApp {
+  private readonly builder = Connection.builder();
+
+  constructor(options: AppOptions = {}) {
+    if (options.name) {
+      this.builder.name(options.name);
+    }
+    this.builder.withHandler({
+      handleMessage: (message, cx) =>
+        sessionUpdateRouter(cx).handleMessage(message),
+      describe: () => "client-session-update-router",
+    });
+  }
+
+  /** @internal */
+  [appBuilder](): ConnectionBuilder {
+    return this.builder;
+  }
+
+  /**
+   * Connects this client app to a transport stream.
+   */
+  connect(stream: Stream): Connection;
+  /**
+   * Connects this client app directly to an agent app.
+   *
+   * This is useful for tests and in-process examples that do not need a
+   * transport.
+   */
+  connect(agent: AgentApp): Connection;
+  connect(target: Stream | AgentApp): Connection {
+    return this.connectTarget(target);
+  }
+
+  /**
+   * Connects this client app to a transport stream for the lifetime of `op`.
+   *
+   * The callback receives a `ClientContext` for calling agent-side methods.
+   * When `op` resolves or rejects, the connection is closed.
+   */
+  connectWith<T>(
+    stream: Stream,
+    op: (context: ClientContext) => MaybePromise<T>,
+  ): Promise<T>;
+  /**
+   * Connects this client app directly to an agent app for the lifetime of `op`.
+   */
+  connectWith<T>(
+    agent: AgentApp,
+    op: (context: ClientContext) => MaybePromise<T>,
+  ): Promise<T>;
+  connectWith<T>(
+    target: Stream | AgentApp,
+    op: (context: ClientContext) => MaybePromise<T>,
+  ): Promise<T> {
+    return this.connectTarget(target).runUntil((cx) =>
+      op(new ClientContext(cx)),
+    );
+  }
+
+  /**
+   * Registers a client request handler by ACP method name.
+   *
+   * Built-in method literals infer their params and response types from
+   * `method`. Pass a parser as the second argument to register custom extension
+   * methods.
+   */
+  onRequest<Method extends ClientRequestMethod>(
+    method: Method,
+    handler: ClientRequestHandlersByMethod[Method],
+  ): this;
+  onRequest<Params, Response>(
+    method: string,
+    params: ParamsParser<Params>,
+    handler: ClientRequestHandler<Params, Response>,
+  ): this;
+  onRequest<Params, Response>(
+    method: string,
+    handlerOrParams:
+      | ClientRequestHandlersByMethod[ClientRequestMethod]
+      | ParamsParser<Params>,
+    handler?: ClientRequestHandler<Params, Response>,
+  ): this {
+    if (handler) {
+      return this.request(
+        { method, params: handlerOrParams as ParamsParser<Params> },
+        handler,
+      );
+    }
+
+    const spec = clientRequestSpecsByMethod[method];
+    if (!spec) {
+      throw new Error(
+        `Unknown ACP request method '${method}'. Pass a params parser for custom methods.`,
+      );
+    }
+
+    return this.request(
+      spec as AcpRequestSpec<unknown, unknown, unknown>,
+      handlerOrParams as ClientRequestHandler<unknown, unknown>,
+    );
+  }
+
+  /**
+   * Registers a client notification handler by ACP method name.
+   *
+   * Built-in method literals infer their params type from `method`. Pass a
+   * parser as the second argument to register custom extension notifications.
+   */
+  onNotification<Method extends ClientNotificationMethod>(
+    method: Method,
+    handler: ClientNotificationHandlersByMethod[Method],
+  ): this;
+  onNotification<Params>(
+    method: string,
+    params: ParamsParser<Params>,
+    handler: ClientNotificationHandler<Params>,
+  ): this;
+  onNotification<Params>(
+    method: string,
+    handlerOrParams:
+      | ClientNotificationHandlersByMethod[ClientNotificationMethod]
+      | ParamsParser<Params>,
+    handler?: ClientNotificationHandler<Params>,
+  ): this {
+    if (handler) {
+      return this.notification(
+        { method, params: handlerOrParams as ParamsParser<Params> },
+        handler,
+      );
+    }
+
+    const spec = clientNotificationSpecsByMethod[method];
+    if (!spec) {
+      throw new Error(
+        `Unknown ACP notification method '${method}'. Pass a params parser for custom methods.`,
+      );
+    }
+
+    return this.notification(
+      spec as AcpNotificationSpec<unknown>,
+      handlerOrParams as ClientNotificationHandler<unknown>,
+    );
+  }
+
+  private request<Params, Response, WireResponse = Response>(
+    spec: AcpRequestSpec<Params, Response, WireResponse>,
+    handler: ClientRequestHandler<Params, Response>,
+  ): this {
+    registerAppRequest(
+      this.builder,
+      spec,
+      (params, cx) => clientHandlerContext(params, new ClientContext(cx)),
+      handler,
+    );
+    return this;
+  }
+
+  private notification<Params>(
+    spec: AcpNotificationSpec<Params>,
+    handler: ClientNotificationHandler<Params>,
+  ): this {
+    registerAppNotification(
+      this.builder,
+      spec,
+      (params, cx) => clientHandlerContext(params, new ClientContext(cx)),
+      handler,
+    );
+    return this;
+  }
+
+  private connectTarget(target: Stream | AgentApp): Connection {
+    if (isStream(target)) {
+      return this.builder.connect(target);
+    }
+
+    return connectInProcess(
+      (stream) => this.builder.connect(stream),
+      (stream) => target.connect(stream),
+    );
+  }
+}
+
+const legacyAgentRequestMethods = new Set<string>([
+  schema.AGENT_METHODS.initialize,
+  schema.AGENT_METHODS.authenticate,
+  schema.AGENT_METHODS.providers_list,
+  schema.AGENT_METHODS.providers_set,
+  schema.AGENT_METHODS.providers_disable,
+  schema.AGENT_METHODS.session_new,
+  schema.AGENT_METHODS.session_load,
+  schema.AGENT_METHODS.session_set_mode,
+  schema.AGENT_METHODS.session_set_config_option,
+  schema.AGENT_METHODS.session_prompt,
+  schema.AGENT_METHODS.session_list,
+  schema.AGENT_METHODS.session_delete,
+  schema.AGENT_METHODS.session_fork,
+  schema.AGENT_METHODS.session_resume,
+  schema.AGENT_METHODS.session_close,
+  schema.AGENT_METHODS.logout,
+  schema.AGENT_METHODS.nes_start,
+  schema.AGENT_METHODS.nes_suggest,
+  schema.AGENT_METHODS.nes_close,
+]);
+
+const legacyAgentNotificationMethods = new Set<string>([
+  schema.AGENT_METHODS.session_cancel,
+  schema.AGENT_METHODS.nes_accept,
+  schema.AGENT_METHODS.nes_reject,
+  schema.AGENT_METHODS.document_did_open,
+  schema.AGENT_METHODS.document_did_change,
+  schema.AGENT_METHODS.document_did_close,
+  schema.AGENT_METHODS.document_did_save,
+  schema.AGENT_METHODS.document_did_focus,
+]);
+
+const legacyClientRequestMethods = new Set<string>([
+  schema.CLIENT_METHODS.session_request_permission,
+  schema.CLIENT_METHODS.fs_write_text_file,
+  schema.CLIENT_METHODS.fs_read_text_file,
+  schema.CLIENT_METHODS.terminal_create,
+  schema.CLIENT_METHODS.terminal_output,
+  schema.CLIENT_METHODS.terminal_release,
+  schema.CLIENT_METHODS.terminal_wait_for_exit,
+  schema.CLIENT_METHODS.terminal_kill,
+  schema.CLIENT_METHODS.elicitation_create,
+]);
+
+const legacyClientNotificationMethods = new Set<string>([
+  schema.CLIENT_METHODS.session_update,
+  schema.CLIENT_METHODS.elicitation_complete,
+]);
+
+function legacyAgentApp(implementation: Agent): AgentApp {
+  const app = agent()
+    .onRequest(schema.AGENT_METHODS.initialize, (c) =>
+      implementation.initialize(c.params),
+    )
+    .onRequest(schema.AGENT_METHODS.session_new, (c) =>
+      implementation.newSession(c.params),
+    )
+    .onRequest(
+      schema.AGENT_METHODS.authenticate,
+      async (c) => (await implementation.authenticate(c.params)) ?? {},
+    )
+    .onRequest(schema.AGENT_METHODS.session_prompt, (c) =>
+      implementation.prompt(c.params),
+    )
+    .onNotification(schema.AGENT_METHODS.session_cancel, (c) =>
+      implementation.cancel(c.params),
+    );
+
+  if (implementation.loadSession) {
+    app.onRequest(schema.AGENT_METHODS.session_load, (c) =>
+      implementation.loadSession!(c.params),
+    );
+  }
+  if (implementation.listSessions) {
+    app.onRequest(schema.AGENT_METHODS.session_list, (c) =>
+      implementation.listSessions!(c.params),
+    );
+  }
+  if (implementation.deleteSession) {
+    app.onRequest(
+      schema.AGENT_METHODS.session_delete,
+      async (c) => (await implementation.deleteSession!(c.params)) ?? {},
+    );
+  }
+  if (implementation.unstable_forkSession) {
+    app.onRequest(schema.AGENT_METHODS.session_fork, (c) =>
+      implementation.unstable_forkSession!(c.params),
+    );
+  }
+  if (implementation.resumeSession) {
+    app.onRequest(schema.AGENT_METHODS.session_resume, (c) =>
+      implementation.resumeSession!(c.params),
+    );
+  }
+  if (implementation.closeSession) {
+    app.onRequest(
+      schema.AGENT_METHODS.session_close,
+      async (c) => (await implementation.closeSession!(c.params)) ?? {},
+    );
+  }
+  if (implementation.setSessionMode) {
+    app.onRequest(
+      schema.AGENT_METHODS.session_set_mode,
+      async (c) => (await implementation.setSessionMode!(c.params)) ?? {},
+    );
+  }
+  if (implementation.setSessionConfigOption) {
+    app.onRequest(schema.AGENT_METHODS.session_set_config_option, (c) =>
+      implementation.setSessionConfigOption!(c.params),
+    );
+  }
+  if (implementation.unstable_listProviders) {
+    app.onRequest(schema.AGENT_METHODS.providers_list, (c) =>
+      implementation.unstable_listProviders!(c.params),
+    );
+  }
+  if (implementation.unstable_setProvider) {
+    app.onRequest(
+      schema.AGENT_METHODS.providers_set,
+      async (c) => (await implementation.unstable_setProvider!(c.params)) ?? {},
+    );
+  }
+  if (implementation.unstable_disableProvider) {
+    app.onRequest(
+      schema.AGENT_METHODS.providers_disable,
+      async (c) =>
+        (await implementation.unstable_disableProvider!(c.params)) ?? {},
+    );
+  }
+  if (implementation.logout) {
+    app.onRequest(
+      schema.AGENT_METHODS.logout,
+      async (c) => (await implementation.logout!(c.params)) ?? {},
+    );
+  }
+  if (implementation.unstable_startNes) {
+    app.onRequest(schema.AGENT_METHODS.nes_start, (c) =>
+      implementation.unstable_startNes!(c.params),
+    );
+  }
+  if (implementation.unstable_suggestNes) {
+    app.onRequest(schema.AGENT_METHODS.nes_suggest, (c) =>
+      implementation.unstable_suggestNes!(c.params),
+    );
+  }
+  if (implementation.unstable_closeNes) {
+    app.onRequest(
+      schema.AGENT_METHODS.nes_close,
+      async (c) => (await implementation.unstable_closeNes!(c.params)) ?? {},
+    );
+  }
+  if (implementation.unstable_didOpenDocument) {
+    app.onNotification(schema.AGENT_METHODS.document_did_open, (c) =>
+      implementation.unstable_didOpenDocument!(c.params),
+    );
+  }
+  if (implementation.unstable_didChangeDocument) {
+    app.onNotification(schema.AGENT_METHODS.document_did_change, (c) =>
+      implementation.unstable_didChangeDocument!(c.params),
+    );
+  }
+  if (implementation.unstable_didCloseDocument) {
+    app.onNotification(schema.AGENT_METHODS.document_did_close, (c) =>
+      implementation.unstable_didCloseDocument!(c.params),
+    );
+  }
+  if (implementation.unstable_didSaveDocument) {
+    app.onNotification(schema.AGENT_METHODS.document_did_save, (c) =>
+      implementation.unstable_didSaveDocument!(c.params),
+    );
+  }
+  if (implementation.unstable_didFocusDocument) {
+    app.onNotification(schema.AGENT_METHODS.document_did_focus, (c) =>
+      implementation.unstable_didFocusDocument!(c.params),
+    );
+  }
+  if (implementation.unstable_acceptNes) {
+    app.onNotification(schema.AGENT_METHODS.nes_accept, (c) =>
+      implementation.unstable_acceptNes!(c.params),
+    );
+  }
+  if (implementation.unstable_rejectNes) {
+    app.onNotification(schema.AGENT_METHODS.nes_reject, (c) =>
+      implementation.unstable_rejectNes!(c.params),
+    );
+  }
+
+  if (implementation.extMethod) {
+    app[appBuilder]().withHandler({
+      handleMessage: async (message) => {
+        if (
+          message.kind !== "request" ||
+          legacyAgentRequestMethods.has(message.method)
+        ) {
+          return Handled.no(message);
+        }
+
+        await message.responder.respond(
+          await implementation.extMethod!(
+            message.method,
+            message.params as Record<string, unknown>,
+          ),
+        );
+        return Handled.yes();
+      },
+      describe: () => "legacy-agent-extension-request",
+    });
+  }
+  if (implementation.extNotification) {
+    app[appBuilder]().withHandler({
+      handleMessage: async (message) => {
+        if (
+          message.kind !== "notification" ||
+          legacyAgentNotificationMethods.has(message.method)
+        ) {
+          return Handled.no(message);
+        }
+
+        await implementation.extNotification!(
+          message.method,
+          message.params as Record<string, unknown>,
+        );
+        return Handled.yes();
+      },
+      describe: () => "legacy-agent-extension-notification",
+    });
+  }
+
+  return app;
+}
+
+function legacyClientApp(implementation: Client): ClientApp {
+  const app = client()
+    .onRequest(schema.CLIENT_METHODS.session_request_permission, (c) =>
+      implementation.requestPermission(c.params),
+    )
+    .onNotification(schema.CLIENT_METHODS.session_update, (c) =>
+      implementation.sessionUpdate(c.params),
+    )
+    .onRequest(
+      schema.CLIENT_METHODS.fs_write_text_file,
+      async (c) => (await implementation.writeTextFile?.(c.params)) ?? {},
+    )
+    .onRequest(
+      schema.CLIENT_METHODS.fs_read_text_file,
+      async (c) =>
+        (await implementation.readTextFile?.(
+          c.params,
+        )) as schema.ReadTextFileResponse,
+    )
+    .onRequest(
+      schema.CLIENT_METHODS.terminal_create,
+      async (c) =>
+        (await implementation.createTerminal?.(
+          c.params,
+        )) as schema.CreateTerminalResponse,
+    )
+    .onRequest(
+      schema.CLIENT_METHODS.terminal_output,
+      async (c) =>
+        (await implementation.terminalOutput?.(
+          c.params,
+        )) as schema.TerminalOutputResponse,
+    )
+    .onRequest(
+      schema.CLIENT_METHODS.terminal_release,
+      async (c) => (await implementation.releaseTerminal?.(c.params)) ?? {},
+    )
+    .onRequest(
+      schema.CLIENT_METHODS.terminal_wait_for_exit,
+      async (c) =>
+        (await implementation.waitForTerminalExit?.(
+          c.params,
+        )) as schema.WaitForTerminalExitResponse,
+    )
+    .onRequest(
+      schema.CLIENT_METHODS.terminal_kill,
+      async (c) => (await implementation.killTerminal?.(c.params)) ?? {},
+    );
+
+  if (implementation.unstable_createElicitation) {
+    app.onRequest(schema.CLIENT_METHODS.elicitation_create, (c) =>
+      implementation.unstable_createElicitation!(c.params),
+    );
+  }
+  if (implementation.unstable_completeElicitation) {
+    app.onNotification(schema.CLIENT_METHODS.elicitation_complete, (c) =>
+      implementation.unstable_completeElicitation!(c.params),
+    );
+  }
+
+  if (implementation.extMethod) {
+    app[appBuilder]().withHandler({
+      handleMessage: async (message) => {
+        if (
+          message.kind !== "request" ||
+          legacyClientRequestMethods.has(message.method)
+        ) {
+          return Handled.no(message);
+        }
+
+        await message.responder.respond(
+          await implementation.extMethod!(
+            message.method,
+            message.params as Record<string, unknown>,
+          ),
+        );
+        return Handled.yes();
+      },
+      describe: () => "legacy-client-extension-request",
+    });
+  }
+  if (implementation.extNotification) {
+    app[appBuilder]().withHandler({
+      handleMessage: async (message) => {
+        if (
+          message.kind !== "notification" ||
+          legacyClientNotificationMethods.has(message.method)
+        ) {
+          return Handled.no(message);
+        }
+
+        await implementation.extNotification!(
+          message.method,
+          message.params as Record<string, unknown>,
+        );
+        return Handled.yes();
+      },
+      describe: () => "legacy-client-extension-notification",
+    });
+  }
+
+  return app;
 }
 
 /**
@@ -39,6 +2190,9 @@ function rejectedPromise<T>(error: unknown): Promise<T> {
  * and sending session updates.
  *
  * See protocol docs: [Agent](https://agentclientprotocol.com/protocol/overview#agent)
+ *
+ * @deprecated Prefer {@link agent}, which registers typed handlers with a
+ * single context object and supports direct app composition.
  */
 export class AgentSideConnection {
   private connection: Connection;
@@ -54,219 +2208,11 @@ export class AgentSideConnection {
    *                 {@link ndJsonStream} for stdio-based connections.
    *
    * See protocol docs: [Communication Model](https://agentclientprotocol.com/protocol/overview#communication-model)
+   *
+   * @deprecated Prefer `agent({ name }).connect(stream)`.
    */
   constructor(toAgent: (conn: AgentSideConnection) => Agent, stream: Stream) {
-    const agent = toAgent(this);
-
-    const requestHandler = async (
-      method: string,
-      params: unknown,
-    ): Promise<unknown> => {
-      switch (method) {
-        case schema.AGENT_METHODS.initialize: {
-          const validatedParams = validate.zInitializeRequest.parse(params);
-          return agent.initialize(validatedParams);
-        }
-        case schema.AGENT_METHODS.session_new: {
-          const validatedParams = validate.zNewSessionRequest.parse(params);
-          return agent.newSession(validatedParams);
-        }
-        case schema.AGENT_METHODS.session_load: {
-          if (!agent.loadSession) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams = validate.zLoadSessionRequest.parse(params);
-          return agent.loadSession(validatedParams);
-        }
-        case schema.AGENT_METHODS.session_list: {
-          if (!agent.listSessions) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams = validate.zListSessionsRequest.parse(params);
-          return agent.listSessions(validatedParams);
-        }
-        case schema.AGENT_METHODS.session_delete: {
-          if (!agent.deleteSession) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams = validate.zDeleteSessionRequest.parse(params);
-          const result = await agent.deleteSession(validatedParams);
-          return result ?? {};
-        }
-        case schema.AGENT_METHODS.session_fork: {
-          if (!agent.unstable_forkSession) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams = validate.zForkSessionRequest.parse(params);
-          return agent.unstable_forkSession(validatedParams);
-        }
-        case schema.AGENT_METHODS.session_resume: {
-          if (!agent.resumeSession) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams = validate.zResumeSessionRequest.parse(params);
-          return agent.resumeSession(validatedParams);
-        }
-        case schema.AGENT_METHODS.session_close: {
-          if (!agent.closeSession) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams = validate.zCloseSessionRequest.parse(params);
-          const result = await agent.closeSession(validatedParams);
-          return result ?? {};
-        }
-        case schema.AGENT_METHODS.session_set_mode: {
-          if (!agent.setSessionMode) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams = validate.zSetSessionModeRequest.parse(params);
-          const result = await agent.setSessionMode(validatedParams);
-          return result ?? {};
-        }
-        case schema.AGENT_METHODS.authenticate: {
-          const validatedParams = validate.zAuthenticateRequest.parse(params);
-          const result = await agent.authenticate(validatedParams);
-          return result ?? {};
-        }
-        case schema.AGENT_METHODS.providers_list: {
-          if (!agent.unstable_listProviders) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams = validate.zListProvidersRequest.parse(params);
-          return agent.unstable_listProviders(validatedParams);
-        }
-        case schema.AGENT_METHODS.providers_set: {
-          if (!agent.unstable_setProvider) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams = validate.zSetProviderRequest.parse(params);
-          const result = await agent.unstable_setProvider(validatedParams);
-          return result ?? {};
-        }
-        case schema.AGENT_METHODS.providers_disable: {
-          if (!agent.unstable_disableProvider) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams =
-            validate.zDisableProviderRequest.parse(params);
-          const result = await agent.unstable_disableProvider(validatedParams);
-          return result ?? {};
-        }
-        case schema.AGENT_METHODS.logout: {
-          if (!agent.logout) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams = validate.zLogoutRequest.parse(params);
-          const result = await agent.logout(validatedParams);
-          return result ?? {};
-        }
-        case schema.AGENT_METHODS.session_prompt: {
-          const validatedParams = validate.zPromptRequest.parse(params);
-          return agent.prompt(validatedParams);
-        }
-        case schema.AGENT_METHODS.session_set_config_option: {
-          if (!agent.setSessionConfigOption) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams =
-            validate.zSetSessionConfigOptionRequest.parse(params);
-          return agent.setSessionConfigOption(validatedParams);
-        }
-        case schema.AGENT_METHODS.nes_start: {
-          if (!agent.unstable_startNes) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams = validate.zStartNesRequest.parse(params);
-          return agent.unstable_startNes(validatedParams);
-        }
-        case schema.AGENT_METHODS.nes_suggest: {
-          if (!agent.unstable_suggestNes) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams = validate.zSuggestNesRequest.parse(params);
-          return agent.unstable_suggestNes(validatedParams);
-        }
-        case schema.AGENT_METHODS.nes_close: {
-          if (!agent.unstable_closeNes) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams = validate.zCloseNesRequest.parse(params);
-          const result = await agent.unstable_closeNes(validatedParams);
-          return result ?? {};
-        }
-        default:
-          if (agent.extMethod) {
-            return agent.extMethod(method, params as Record<string, unknown>);
-          }
-          throw RequestError.methodNotFound(method);
-      }
-    };
-
-    const notificationHandler = async (
-      method: string,
-      params: unknown,
-    ): Promise<void> => {
-      switch (method) {
-        case schema.AGENT_METHODS.session_cancel: {
-          const validatedParams = validate.zCancelNotification.parse(params);
-          return agent.cancel(validatedParams);
-        }
-        case schema.AGENT_METHODS.document_did_open: {
-          if (!agent.unstable_didOpenDocument) return;
-          const validatedParams =
-            validate.zDidOpenDocumentNotification.parse(params);
-          return agent.unstable_didOpenDocument(validatedParams);
-        }
-        case schema.AGENT_METHODS.document_did_change: {
-          if (!agent.unstable_didChangeDocument) return;
-          const validatedParams =
-            validate.zDidChangeDocumentNotification.parse(params);
-          return agent.unstable_didChangeDocument(validatedParams);
-        }
-        case schema.AGENT_METHODS.document_did_close: {
-          if (!agent.unstable_didCloseDocument) return;
-          const validatedParams =
-            validate.zDidCloseDocumentNotification.parse(params);
-          return agent.unstable_didCloseDocument(validatedParams);
-        }
-        case schema.AGENT_METHODS.document_did_save: {
-          if (!agent.unstable_didSaveDocument) return;
-          const validatedParams =
-            validate.zDidSaveDocumentNotification.parse(params);
-          return agent.unstable_didSaveDocument(validatedParams);
-        }
-        case schema.AGENT_METHODS.document_did_focus: {
-          if (!agent.unstable_didFocusDocument) return;
-          const validatedParams =
-            validate.zDidFocusDocumentNotification.parse(params);
-          return agent.unstable_didFocusDocument(validatedParams);
-        }
-        case schema.AGENT_METHODS.nes_accept: {
-          if (!agent.unstable_acceptNes) return;
-          const validatedParams = validate.zAcceptNesNotification.parse(params);
-          return agent.unstable_acceptNes(validatedParams);
-        }
-        case schema.AGENT_METHODS.nes_reject: {
-          if (!agent.unstable_rejectNes) return;
-          const validatedParams = validate.zRejectNesNotification.parse(params);
-          return agent.unstable_rejectNes(validatedParams);
-        }
-        default:
-          if (agent.extNotification) {
-            return agent.extNotification(
-              method,
-              params as Record<string, unknown>,
-            );
-          }
-          throw RequestError.methodNotFound(method);
-      }
-    };
-
-    this.connection = new Connection(
-      requestHandler,
-      notificationHandler,
-      stream,
-    );
+    this.connection = legacyAgentApp(toAgent(this)).connect(stream);
   }
 
   /**
@@ -412,27 +2358,66 @@ export class AgentSideConnection {
   }
 
   /**
-   * Extension method
+   * Sends a request to the client by ACP method name.
    *
-   * Allows the Agent to send an arbitrary request that is not part of the ACP spec.
+   * Built-in method literals infer their params and response types. Custom
+   * methods can specify their response and params types with generics.
+   */
+  request<Method extends ClientRequestMethod>(
+    method: Method,
+    params: ClientRequestParamsByMethod[Method],
+  ): Promise<ClientRequestResponsesByMethod[Method]>;
+  request<Response = unknown, Params = unknown>(
+    method: string,
+    params?: Params,
+  ): Promise<Response>;
+  request(method: string, params?: unknown): Promise<unknown> {
+    const spec = clientRequestSpecsByMethod[method] as
+      | AcpRequestSpec<unknown, unknown, unknown>
+      | undefined;
+    return this.connection.sendRequest(method, params, spec?.mapResponse);
+  }
+
+  /**
+   * Sends a notification to the client by ACP method name.
+   *
+   * Built-in method literals infer their params type. Custom notifications can
+   * specify their params type with a generic.
+   */
+  notify<Method extends ClientNotificationMethod>(
+    method: Method,
+    params: ClientNotificationParamsByMethod[Method],
+  ): Promise<void>;
+  notify<Params = unknown>(method: string, params?: Params): Promise<void>;
+  notify(method: string, params?: unknown): Promise<void> {
+    return this.connection.sendNotification(method, params);
+  }
+
+  /**
+   * Extension method.
+   *
+   * @deprecated Use {@link request}.
    */
   extMethod(
     method: string,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    return this.connection.sendRequest(method, params);
+    return this.request<Record<string, unknown>, Record<string, unknown>>(
+      method,
+      params,
+    );
   }
 
   /**
-   * Extension notification
+   * Extension notification.
    *
-   * Allows the Agent to send an arbitrary notification that is not part of the ACP spec.
+   * @deprecated Use {@link notify}.
    */
   extNotification(
     method: string,
     params: Record<string, unknown>,
   ): Promise<void> {
-    return this.connection.sendNotification(method, params);
+    return this.notify(method, params);
   }
 
   /**
@@ -504,14 +2489,20 @@ export class AgentSideConnection {
  * goes out of scope.
  */
 export class TerminalHandle {
+  /**
+   * Terminal identifier returned by `terminal/create`.
+   */
+  public id: string;
   private sessionId: string;
-  private connection: Connection;
+  private connection: Pick<Connection, "sendRequest">;
 
+  /** @internal */
   constructor(
-    public id: string,
+    id: string,
     sessionId: string,
-    conn: Connection,
+    conn: Pick<Connection, "sendRequest">,
   ) {
+    this.id = id;
     this.sessionId = sessionId;
     this.connection = conn;
   }
@@ -589,6 +2580,9 @@ export class TerminalHandle {
     );
   }
 
+  /**
+   * Releases the terminal when used with `await using`.
+   */
   async [Symbol.asyncDispose](): Promise<void> {
     await this.release();
   }
@@ -603,6 +2597,9 @@ export class TerminalHandle {
  * prompts, and managing the agent lifecycle.
  *
  * See protocol docs: [Client](https://agentclientprotocol.com/protocol/overview#client)
+ *
+ * @deprecated Prefer {@link client}, which registers typed handlers with a
+ * single context object and supports `connectWith` and session helpers.
  */
 export class ClientSideConnection implements Agent {
   private connection: Connection;
@@ -618,100 +2615,11 @@ export class ClientSideConnection implements Agent {
    *                 {@link ndJsonStream} for stdio-based connections.
    *
    * See protocol docs: [Communication Model](https://agentclientprotocol.com/protocol/overview#communication-model)
+   *
+   * @deprecated Prefer `client({ name }).connectWith(stream, async (agent) => ...)`.
    */
   constructor(toClient: (agent: Agent) => Client, stream: Stream) {
-    const client = toClient(this);
-
-    const requestHandler = async (
-      method: string,
-      params: unknown,
-    ): Promise<unknown> => {
-      switch (method) {
-        case schema.CLIENT_METHODS.fs_write_text_file: {
-          const validatedParams = validate.zWriteTextFileRequest.parse(params);
-          const result = await client.writeTextFile?.(validatedParams);
-          return result ?? {};
-        }
-        case schema.CLIENT_METHODS.fs_read_text_file: {
-          const validatedParams = validate.zReadTextFileRequest.parse(params);
-          return client.readTextFile?.(validatedParams);
-        }
-        case schema.CLIENT_METHODS.session_request_permission: {
-          const validatedParams =
-            validate.zRequestPermissionRequest.parse(params);
-          return client.requestPermission(validatedParams);
-        }
-        case schema.CLIENT_METHODS.terminal_create: {
-          const validatedParams = validate.zCreateTerminalRequest.parse(params);
-          return client.createTerminal?.(validatedParams);
-        }
-        case schema.CLIENT_METHODS.terminal_output: {
-          const validatedParams = validate.zTerminalOutputRequest.parse(params);
-          return client.terminalOutput?.(validatedParams);
-        }
-        case schema.CLIENT_METHODS.terminal_release: {
-          const validatedParams =
-            validate.zReleaseTerminalRequest.parse(params);
-          const result = await client.releaseTerminal?.(validatedParams);
-          return result ?? {};
-        }
-        case schema.CLIENT_METHODS.terminal_wait_for_exit: {
-          const validatedParams =
-            validate.zWaitForTerminalExitRequest.parse(params);
-          return client.waitForTerminalExit?.(validatedParams);
-        }
-        case schema.CLIENT_METHODS.terminal_kill: {
-          const validatedParams = validate.zKillTerminalRequest.parse(params);
-          const result = await client.killTerminal?.(validatedParams);
-          return result ?? {};
-        }
-        case schema.CLIENT_METHODS.elicitation_create: {
-          if (!client.unstable_createElicitation) {
-            throw RequestError.methodNotFound(method);
-          }
-          const validatedParams =
-            validate.zCreateElicitationRequest.parse(params);
-          return client.unstable_createElicitation(validatedParams);
-        }
-        default:
-          if (client.extMethod) {
-            return client.extMethod(method, params as Record<string, unknown>);
-          }
-          throw RequestError.methodNotFound(method);
-      }
-    };
-
-    const notificationHandler = async (
-      method: string,
-      params: unknown,
-    ): Promise<void> => {
-      switch (method) {
-        case schema.CLIENT_METHODS.session_update: {
-          const validatedParams = validate.zSessionNotification.parse(params);
-          return client.sessionUpdate(validatedParams);
-        }
-        case schema.CLIENT_METHODS.elicitation_complete: {
-          if (!client.unstable_completeElicitation) return;
-          const validatedParams =
-            validate.zCompleteElicitationNotification.parse(params);
-          return client.unstable_completeElicitation(validatedParams);
-        }
-        default:
-          if (client.extNotification) {
-            return client.extNotification(
-              method,
-              params as Record<string, unknown>,
-            );
-          }
-          throw RequestError.methodNotFound(method);
-      }
-    };
-
-    this.connection = new Connection(
-      requestHandler,
-      notificationHandler,
-      stream,
-    );
+    this.connection = legacyClientApp(toClient(this)).connect(stream);
   }
 
   /**
@@ -871,10 +2779,10 @@ export class ClientSideConnection implements Agent {
   closeSession(
     params: schema.CloseSessionRequest,
   ): Promise<schema.CloseSessionResponse> {
-    return this.connection.sendRequest(
-      schema.AGENT_METHODS.session_close,
-      params,
-    );
+    return this.connection.sendRequest<
+      schema.CloseSessionRequest,
+      schema.CloseSessionResponse
+    >(schema.AGENT_METHODS.session_close, params, emptyObjectResponse);
   }
 
   /**
@@ -1200,27 +3108,66 @@ export class ClientSideConnection implements Agent {
   }
 
   /**
-   * Extension method
+   * Sends a request to the agent by ACP method name.
    *
-   * Allows the Client to send an arbitrary request that is not part of the ACP spec.
+   * Built-in method literals infer their params and response types. Custom
+   * methods can specify their response and params types with generics.
+   */
+  request<Method extends AgentRequestMethod>(
+    method: Method,
+    params: AgentRequestParamsByMethod[Method],
+  ): Promise<AgentRequestResponsesByMethod[Method]>;
+  request<Response = unknown, Params = unknown>(
+    method: string,
+    params?: Params,
+  ): Promise<Response>;
+  request(method: string, params?: unknown): Promise<unknown> {
+    const spec = agentRequestSpecsByMethod[method] as
+      | AcpRequestSpec<unknown, unknown, unknown>
+      | undefined;
+    return this.connection.sendRequest(method, params, spec?.mapResponse);
+  }
+
+  /**
+   * Sends a notification to the agent by ACP method name.
+   *
+   * Built-in method literals infer their params type. Custom notifications can
+   * specify their params type with a generic.
+   */
+  notify<Method extends AgentNotificationMethod>(
+    method: Method,
+    params: AgentNotificationParamsByMethod[Method],
+  ): Promise<void>;
+  notify<Params = unknown>(method: string, params?: Params): Promise<void>;
+  notify(method: string, params?: unknown): Promise<void> {
+    return this.connection.sendNotification(method, params);
+  }
+
+  /**
+   * Extension method.
+   *
+   * @deprecated Use {@link request}.
    */
   extMethod(
     method: string,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    return this.connection.sendRequest(method, params);
+    return this.request<Record<string, unknown>, Record<string, unknown>>(
+      method,
+      params,
+    );
   }
 
   /**
-   * Extension notification
+   * Extension notification.
    *
-   * Allows the Client to send an arbitrary notification that is not part of the ACP spec.
+   * @deprecated Use {@link notify}.
    */
   extNotification(
     method: string,
     params: Record<string, unknown>,
   ): Promise<void> {
-    return this.connection.sendNotification(method, params);
+    return this.notify(method, params);
   }
 
   /**
@@ -1275,446 +3222,6 @@ export class ClientSideConnection implements Agent {
   }
 }
 
-export type { AnyMessage } from "./jsonrpc.js";
-
-class Connection {
-  private pendingResponses: Map<
-    string | number | null,
-    ConnectionPendingResponse
-  > = new Map();
-  private nextRequestId: number = 0;
-  private requestHandler: RequestHandler;
-  private notificationHandler: NotificationHandler;
-  private stream: Stream;
-  private writeQueue: Promise<void> = Promise.resolve();
-  private abortController = new AbortController();
-  private closedPromise: Promise<void>;
-
-  constructor(
-    requestHandler: RequestHandler,
-    notificationHandler: NotificationHandler,
-    stream: Stream,
-  ) {
-    this.requestHandler = requestHandler;
-    this.notificationHandler = notificationHandler;
-    this.stream = stream;
-    this.closedPromise = new Promise((resolve) => {
-      this.abortController.signal.addEventListener("abort", () => resolve());
-    });
-    void this.receive();
-  }
-
-  /**
-   * AbortSignal that aborts when the connection closes.
-   *
-   * This signal can be used to:
-   * - Listen for connection closure via event listeners
-   * - Check connection status synchronously with `signal.aborted`
-   * - Pass to other APIs (fetch, setTimeout) for automatic cancellation
-   */
-  get signal(): AbortSignal {
-    return this.abortController.signal;
-  }
-
-  /**
-   * Promise that resolves when the connection closes.
-   *
-   * The connection closes when the underlying stream ends, either normally
-   * or due to an error. Once closed, the connection cannot send or receive
-   * any more messages.
-   *
-   * @example
-   * ```typescript
-   * const connection = new ClientSideConnection(client, stream);
-   * await connection.closed;
-   * console.log('Connection closed - performing cleanup');
-   * ```
-   */
-  get closed(): Promise<void> {
-    return this.closedPromise;
-  }
-
-  private async receive() {
-    let closeError: unknown = undefined;
-
-    try {
-      const reader = this.stream.readable.getReader();
-      try {
-        while (!this.abortController.signal.aborted) {
-          const { value: message, done } = await reader.read();
-          if (done) {
-            break;
-          }
-          if (!message) {
-            continue;
-          }
-
-          try {
-            this.processMessage(message);
-          } catch (err) {
-            console.error(
-              "Unexpected error during message processing:",
-              message,
-              err,
-            );
-            // Only send error response if the message had an id (was a request)
-            if ("id" in message && message.id !== undefined) {
-              this.sendMessage({
-                jsonrpc: "2.0",
-                id: message.id,
-                error: {
-                  code: -32700,
-                  message: "Parse error",
-                },
-              });
-            }
-          }
-        }
-      } finally {
-        reader.releaseLock();
-      }
-    } catch (error) {
-      closeError = error;
-    } finally {
-      this.close(closeError);
-    }
-  }
-
-  private close(error?: unknown) {
-    if (this.abortController.signal.aborted) {
-      return;
-    }
-
-    const closeError: unknown = error ?? new Error("ACP connection closed");
-    for (const pendingResponse of this.pendingResponses.values()) {
-      pendingResponse.reject(closeError);
-    }
-    this.pendingResponses.clear();
-    this.abortController.abort(closeError);
-  }
-
-  private async processMessage(message: AnyMessage) {
-    if ("method" in message && "id" in message) {
-      // It's a request
-      const response = await this.tryCallRequestHandler(
-        message.method,
-        message.params,
-      );
-      if ("error" in response) {
-        console.error("Error handling request", message, response.error);
-      }
-
-      await this.sendMessage({
-        jsonrpc: "2.0",
-        id: message.id,
-        ...response,
-      });
-    } else if ("method" in message) {
-      // It's a notification
-      const response = await this.tryCallNotificationHandler(
-        message.method,
-        message.params,
-      );
-      if ("error" in response) {
-        console.error("Error handling notification", message, response.error);
-      }
-    } else if ("id" in message) {
-      // It's a response
-      this.handleResponse(message);
-    } else {
-      console.error("Invalid message", { message });
-    }
-  }
-
-  private async tryCallRequestHandler(
-    method: string,
-    params: unknown,
-  ): Promise<Result<unknown>> {
-    try {
-      const result = await this.requestHandler(method, params);
-      return { result: result ?? null };
-    } catch (error: unknown) {
-      if (error instanceof RequestError) {
-        return error.toResult();
-      }
-
-      if (error instanceof z.ZodError) {
-        return RequestError.invalidParams(error.format()).toResult();
-      }
-
-      let details;
-
-      if (error instanceof Error) {
-        details = error.message;
-      } else if (
-        typeof error === "object" &&
-        error != null &&
-        "message" in error &&
-        typeof error.message === "string"
-      ) {
-        details = error.message;
-      }
-
-      try {
-        return RequestError.internalError(
-          details ? JSON.parse(details) : {},
-        ).toResult();
-      } catch {
-        return RequestError.internalError({ details }).toResult();
-      }
-    }
-  }
-
-  private async tryCallNotificationHandler(
-    method: string,
-    params: unknown,
-  ): Promise<Result<unknown>> {
-    try {
-      await this.notificationHandler(method, params);
-      return { result: null };
-    } catch (error: unknown) {
-      if (error instanceof RequestError) {
-        return error.toResult();
-      }
-
-      if (error instanceof z.ZodError) {
-        return RequestError.invalidParams(error.format()).toResult();
-      }
-
-      let details;
-
-      if (error instanceof Error) {
-        details = error.message;
-      } else if (
-        typeof error === "object" &&
-        error != null &&
-        "message" in error &&
-        typeof error.message === "string"
-      ) {
-        details = error.message;
-      }
-
-      try {
-        return RequestError.internalError(
-          details ? JSON.parse(details) : {},
-        ).toResult();
-      } catch {
-        return RequestError.internalError({ details }).toResult();
-      }
-    }
-  }
-
-  private handleResponse(response: AnyResponse) {
-    const pendingResponse = this.pendingResponses.get(response.id);
-    if (pendingResponse) {
-      if ("result" in response) {
-        pendingResponse.resolve(response.result);
-      } else if ("error" in response) {
-        const { code, message, data } = response.error;
-        pendingResponse.reject(new RequestError(code, message, data));
-      }
-      this.pendingResponses.delete(response.id);
-    } else {
-      console.error("Got response to unknown request", response.id);
-    }
-  }
-
-  sendRequest<Req, Resp, Output = Resp>(
-    method: string,
-    params?: Req,
-    mapResponse?: (response: Resp) => Output,
-  ): Promise<Output> {
-    if (this.abortController.signal.aborted) {
-      return rejectedPromise(this.closedReason());
-    }
-
-    const id = this.nextRequestId++;
-    const responsePromise = new Promise<Output>((resolve, reject) => {
-      this.pendingResponses.set(id, {
-        resolve: (response) => {
-          try {
-            resolve(
-              mapResponse
-                ? mapResponse(response as Resp)
-                : (response as Output),
-            );
-          } catch (error) {
-            reject(error);
-          }
-        },
-        reject,
-      });
-    });
-    // If the transport fails (or receive observes stream closure) during the
-    // `sendMessage` below, close() will reject `responsePromise`
-    // before the caller has had a chance to attach its own handler. Node then
-    // reports a spurious `unhandledRejection`, even though the caller's
-    // subsequent `await` does observe the rejection. Attach a noop catch so
-    // the rejection is considered handled at the time it's raised; the
-    // rejection is still delivered to the caller via `return responsePromise`.
-    responsePromise.catch(() => {});
-    void this.sendMessage({ jsonrpc: "2.0", id, method, params });
-    return responsePromise;
-  }
-
-  sendNotification<N>(method: string, params?: N): Promise<void> {
-    if (this.abortController.signal.aborted) {
-      return rejectedPromise(this.closedReason());
-    }
-
-    return this.sendMessage({ jsonrpc: "2.0", method, params });
-  }
-
-  private closedReason(): unknown {
-    return (
-      this.abortController.signal.reason ?? new Error("ACP connection closed")
-    );
-  }
-
-  private async sendMessage(message: AnyMessage) {
-    this.writeQueue = this.writeQueue
-      .then(async () => {
-        const writer = this.stream.writable.getWriter();
-        try {
-          await writer.write(message);
-        } finally {
-          writer.releaseLock();
-        }
-      })
-      .catch((error) => {
-        this.close(error);
-      });
-    return this.writeQueue;
-  }
-}
-
-/**
- * JSON-RPC error object.
- *
- * Represents an error that occurred during method execution, following the
- * JSON-RPC 2.0 error object specification with optional additional data.
- *
- * See protocol docs: [JSON-RPC Error Object](https://www.jsonrpc.org/specification#error_object)
- */
-export class RequestError extends Error {
-  data?: unknown;
-
-  constructor(
-    public code: number,
-    message: string,
-    data?: unknown,
-  ) {
-    super(message);
-    this.name = "RequestError";
-    this.data = data;
-  }
-
-  /**
-   * Invalid JSON was received by the server. An error occurred on the server while parsing the JSON text.
-   */
-  static parseError(data?: unknown, additionalMessage?: string): RequestError {
-    return new RequestError(
-      -32700,
-      `Parse error${additionalMessage ? `: ${additionalMessage}` : ""}`,
-      data,
-    );
-  }
-
-  /**
-   * The JSON sent is not a valid Request object.
-   */
-  static invalidRequest(
-    data?: unknown,
-    additionalMessage?: string,
-  ): RequestError {
-    return new RequestError(
-      -32600,
-      `Invalid request${additionalMessage ? `: ${additionalMessage}` : ""}`,
-      data,
-    );
-  }
-
-  /**
-   * The method does not exist / is not available.
-   */
-  static methodNotFound(method: string): RequestError {
-    return new RequestError(-32601, `"Method not found": ${method}`, {
-      method,
-    });
-  }
-
-  /**
-   * Invalid method parameter(s).
-   */
-  static invalidParams(
-    data?: unknown,
-    additionalMessage?: string,
-  ): RequestError {
-    return new RequestError(
-      -32602,
-      `Invalid params${additionalMessage ? `: ${additionalMessage}` : ""}`,
-      data,
-    );
-  }
-
-  /**
-   * Internal JSON-RPC error.
-   */
-  static internalError(
-    data?: unknown,
-    additionalMessage?: string,
-  ): RequestError {
-    return new RequestError(
-      -32603,
-      `Internal error${additionalMessage ? `: ${additionalMessage}` : ""}`,
-      data,
-    );
-  }
-
-  /**
-   * Authentication required.
-   */
-  static authRequired(
-    data?: unknown,
-    additionalMessage?: string,
-  ): RequestError {
-    return new RequestError(
-      -32000,
-      `Authentication required${additionalMessage ? `: ${additionalMessage}` : ""}`,
-      data,
-    );
-  }
-
-  /**
-   * Resource, such as a file, was not found
-   */
-  static resourceNotFound(uri?: string): RequestError {
-    return new RequestError(
-      -32002,
-      `Resource not found${uri ? `: ${uri}` : ""}`,
-      uri && { uri },
-    );
-  }
-
-  toResult<T>(): Result<T> {
-    return {
-      error: {
-        code: this.code,
-        message: this.message,
-        data: this.data,
-      },
-    };
-  }
-
-  toErrorResponse(): ErrorResponse {
-    return {
-      code: this.code,
-      message: this.message,
-      data: this.data,
-    };
-  }
-}
-
 /**
  * The Client interface defines the interface that ACP-compliant clients must implement.
  *
@@ -1737,7 +3244,7 @@ export interface Client {
    */
   requestPermission(
     params: schema.RequestPermissionRequest,
-  ): Promise<schema.RequestPermissionResponse>;
+  ): MaybePromise<schema.RequestPermissionResponse>;
   /**
    * Handles session update notifications from the agent.
    *
@@ -1751,7 +3258,7 @@ export interface Client {
    *
    * See protocol docs: [Agent Reports Output](https://agentclientprotocol.com/protocol/prompt-turn#3-agent-reports-output)
    */
-  sessionUpdate(params: schema.SessionNotification): Promise<void>;
+  sessionUpdate(params: schema.SessionNotification): MaybePromise<void>;
   /**
    * Writes content to a text file in the client's file system.
    *
@@ -1762,7 +3269,7 @@ export interface Client {
    */
   writeTextFile?(
     params: schema.WriteTextFileRequest,
-  ): Promise<schema.WriteTextFileResponse>;
+  ): MaybePromise<schema.WriteTextFileResponse | void>;
   /**
    * Reads content from a text file in the client's file system.
    *
@@ -1773,7 +3280,7 @@ export interface Client {
    */
   readTextFile?(
     params: schema.ReadTextFileRequest,
-  ): Promise<schema.ReadTextFileResponse>;
+  ): MaybePromise<schema.ReadTextFileResponse>;
 
   /**
    * Creates a new terminal to execute a command.
@@ -1787,7 +3294,7 @@ export interface Client {
    */
   createTerminal?(
     params: schema.CreateTerminalRequest,
-  ): Promise<schema.CreateTerminalResponse>;
+  ): MaybePromise<schema.CreateTerminalResponse>;
 
   /**
    * Gets the current output and exit status of a terminal.
@@ -1799,7 +3306,7 @@ export interface Client {
    */
   terminalOutput?(
     params: schema.TerminalOutputRequest,
-  ): Promise<schema.TerminalOutputResponse>;
+  ): MaybePromise<schema.TerminalOutputResponse>;
 
   /**
    * Releases a terminal and frees all associated resources.
@@ -1814,7 +3321,7 @@ export interface Client {
    */
   releaseTerminal?(
     params: schema.ReleaseTerminalRequest,
-  ): Promise<schema.ReleaseTerminalResponse | void>;
+  ): MaybePromise<schema.ReleaseTerminalResponse | void>;
 
   /**
    * Waits for a terminal command to exit and returns its exit status.
@@ -1826,7 +3333,7 @@ export interface Client {
    */
   waitForTerminalExit?(
     params: schema.WaitForTerminalExitRequest,
-  ): Promise<schema.WaitForTerminalExitResponse>;
+  ): MaybePromise<schema.WaitForTerminalExitResponse>;
 
   /**
    * Kills a terminal command without releasing the terminal.
@@ -1843,7 +3350,7 @@ export interface Client {
    */
   killTerminal?(
     params: schema.KillTerminalRequest,
-  ): Promise<schema.KillTerminalResponse | void>;
+  ): MaybePromise<schema.KillTerminalResponse | void>;
 
   /**
    * **UNSTABLE**
@@ -1856,7 +3363,7 @@ export interface Client {
    */
   unstable_createElicitation?(
     params: schema.CreateElicitationRequest,
-  ): Promise<schema.CreateElicitationResponse>;
+  ): MaybePromise<schema.CreateElicitationResponse>;
 
   /**
    * **UNSTABLE**
@@ -1869,30 +3376,34 @@ export interface Client {
    */
   unstable_completeElicitation?(
     params: schema.CompleteElicitationNotification,
-  ): Promise<void>;
+  ): MaybePromise<void>;
 
   /**
-   * Extension method
+   * Handles a request that is not otherwise registered by the legacy client.
    *
    * Allows the Agent to send an arbitrary request that is not part of the ACP spec.
    *
    * To help avoid conflicts, it's a good practice to prefix extension
    * methods with a unique identifier such as domain name.
+   *
+   * @deprecated Prefer `client().onRequest(...)` for custom methods.
    */
   extMethod?(
     method: string,
     params: Record<string, unknown>,
-  ): Promise<Record<string, unknown>>;
+  ): MaybePromise<Record<string, unknown>>;
 
   /**
-   * Extension notification
+   * Handles a notification that is not otherwise registered by the legacy client.
    *
    * Allows the Agent to send an arbitrary notification that is not part of the ACP spec.
+   *
+   * @deprecated Prefer `client().onNotification(...)` for custom notifications.
    */
   extNotification?(
     method: string,
     params: Record<string, unknown>,
-  ): Promise<void>;
+  ): MaybePromise<void>;
 }
 
 /**
@@ -1916,7 +3427,7 @@ export interface Agent {
    */
   initialize(
     params: schema.InitializeRequest,
-  ): Promise<schema.InitializeResponse>;
+  ): MaybePromise<schema.InitializeResponse>;
   /**
    * Creates a new conversation session with the agent.
    *
@@ -1936,7 +3447,7 @@ export interface Agent {
    */
   newSession(
     params: schema.NewSessionRequest,
-  ): Promise<schema.NewSessionResponse>;
+  ): MaybePromise<schema.NewSessionResponse>;
   /**
    * Loads an existing session to resume a previous conversation.
    *
@@ -1954,7 +3465,7 @@ export interface Agent {
    */
   loadSession?(
     params: schema.LoadSessionRequest,
-  ): Promise<schema.LoadSessionResponse>;
+  ): MaybePromise<schema.LoadSessionResponse | void>;
   /**
    * **UNSTABLE**
    *
@@ -1974,7 +3485,7 @@ export interface Agent {
    */
   unstable_forkSession?(
     params: schema.ForkSessionRequest,
-  ): Promise<schema.ForkSessionResponse>;
+  ): MaybePromise<schema.ForkSessionResponse>;
   /**
    * Lists existing sessions from the agent.
    *
@@ -1986,7 +3497,7 @@ export interface Agent {
    */
   listSessions?(
     params: schema.ListSessionsRequest,
-  ): Promise<schema.ListSessionsResponse>;
+  ): MaybePromise<schema.ListSessionsResponse>;
   /**
    * Deletes an existing session returned by `session/list`.
    *
@@ -1994,7 +3505,7 @@ export interface Agent {
    */
   deleteSession?(
     params: schema.DeleteSessionRequest,
-  ): Promise<schema.DeleteSessionResponse | void>;
+  ): MaybePromise<schema.DeleteSessionResponse | void>;
   /**
    * Resumes an existing session without returning previous messages.
    *
@@ -2008,7 +3519,7 @@ export interface Agent {
    */
   resumeSession?(
     params: schema.ResumeSessionRequest,
-  ): Promise<schema.ResumeSessionResponse>;
+  ): MaybePromise<schema.ResumeSessionResponse>;
   /**
    * Closes an active session and frees up any resources associated with it.
    *
@@ -2019,7 +3530,7 @@ export interface Agent {
    */
   closeSession?(
     params: schema.CloseSessionRequest,
-  ): Promise<schema.CloseSessionResponse | void>;
+  ): MaybePromise<schema.CloseSessionResponse | void>;
   /**
    * Sets the operational mode for a session.
    *
@@ -2037,7 +3548,7 @@ export interface Agent {
    */
   setSessionMode?(
     params: schema.SetSessionModeRequest,
-  ): Promise<schema.SetSessionModeResponse | void>;
+  ): MaybePromise<schema.SetSessionModeResponse | void>;
   /**
    * Set a configuration option for a given session.
    *
@@ -2046,7 +3557,7 @@ export interface Agent {
    */
   setSessionConfigOption?(
     params: schema.SetSessionConfigOptionRequest,
-  ): Promise<schema.SetSessionConfigOptionResponse>;
+  ): MaybePromise<schema.SetSessionConfigOptionResponse>;
   /**
    * Authenticates the client using the specified authentication method.
    *
@@ -2060,7 +3571,7 @@ export interface Agent {
    */
   authenticate(
     params: schema.AuthenticateRequest,
-  ): Promise<schema.AuthenticateResponse | void>;
+  ): MaybePromise<schema.AuthenticateResponse | void>;
   /**
    * **UNSTABLE**
    *
@@ -2074,7 +3585,7 @@ export interface Agent {
    */
   unstable_listProviders?(
     params: schema.ListProvidersRequest,
-  ): Promise<schema.ListProvidersResponse>;
+  ): MaybePromise<schema.ListProvidersResponse>;
   /**
    * **UNSTABLE**
    *
@@ -2088,7 +3599,7 @@ export interface Agent {
    */
   unstable_setProvider?(
     params: schema.SetProviderRequest,
-  ): Promise<schema.SetProviderResponse | void>;
+  ): MaybePromise<schema.SetProviderResponse | void>;
   /**
    * **UNSTABLE**
    *
@@ -2102,11 +3613,13 @@ export interface Agent {
    */
   unstable_disableProvider?(
     params: schema.DisableProviderRequest,
-  ): Promise<schema.DisableProviderResponse | void>;
+  ): MaybePromise<schema.DisableProviderResponse | void>;
   /**
    * Logout of the current authentication method.
    */
-  logout?(params: schema.LogoutRequest): Promise<schema.LogoutResponse | void>;
+  logout?(
+    params: schema.LogoutRequest,
+  ): MaybePromise<schema.LogoutResponse | void>;
   /**
    * Processes a user prompt within a session.
    *
@@ -2120,7 +3633,7 @@ export interface Agent {
    *
    * See protocol docs: [Prompt Turn](https://agentclientprotocol.com/protocol/prompt-turn)
    */
-  prompt(params: schema.PromptRequest): Promise<schema.PromptResponse>;
+  prompt(params: schema.PromptRequest): MaybePromise<schema.PromptResponse>;
   /**
    * Cancels ongoing operations for a session.
    *
@@ -2134,7 +3647,7 @@ export interface Agent {
    *
    * See protocol docs: [Cancellation](https://agentclientprotocol.com/protocol/prompt-turn#cancellation)
    */
-  cancel(params: schema.CancelNotification): Promise<void>;
+  cancel(params: schema.CancelNotification): MaybePromise<void>;
 
   /**
    * **UNSTABLE**: This capability is not part of the spec yet, and may be removed or changed at any point.
@@ -2145,7 +3658,7 @@ export interface Agent {
    */
   unstable_startNes?(
     params: schema.StartNesRequest,
-  ): Promise<schema.StartNesResponse>;
+  ): MaybePromise<schema.StartNesResponse>;
   /**
    * **UNSTABLE**: This capability is not part of the spec yet, and may be removed or changed at any point.
    *
@@ -2155,7 +3668,7 @@ export interface Agent {
    */
   unstable_suggestNes?(
     params: schema.SuggestNesRequest,
-  ): Promise<schema.SuggestNesResponse>;
+  ): MaybePromise<schema.SuggestNesResponse>;
   /**
    * **UNSTABLE**: This capability is not part of the spec yet, and may be removed or changed at any point.
    *
@@ -2165,7 +3678,7 @@ export interface Agent {
    */
   unstable_closeNes?(
     params: schema.CloseNesRequest,
-  ): Promise<schema.CloseNesResponse | void>;
+  ): MaybePromise<schema.CloseNesResponse | void>;
 
   /**
    * **UNSTABLE**: This capability is not part of the spec yet, and may be removed or changed at any point.
@@ -2176,7 +3689,7 @@ export interface Agent {
    */
   unstable_didOpenDocument?(
     params: schema.DidOpenDocumentNotification,
-  ): Promise<void>;
+  ): MaybePromise<void>;
   /**
    * **UNSTABLE**: This capability is not part of the spec yet, and may be removed or changed at any point.
    *
@@ -2186,7 +3699,7 @@ export interface Agent {
    */
   unstable_didChangeDocument?(
     params: schema.DidChangeDocumentNotification,
-  ): Promise<void>;
+  ): MaybePromise<void>;
   /**
    * **UNSTABLE**: This capability is not part of the spec yet, and may be removed or changed at any point.
    *
@@ -2196,7 +3709,7 @@ export interface Agent {
    */
   unstable_didCloseDocument?(
     params: schema.DidCloseDocumentNotification,
-  ): Promise<void>;
+  ): MaybePromise<void>;
   /**
    * **UNSTABLE**: This capability is not part of the spec yet, and may be removed or changed at any point.
    *
@@ -2206,7 +3719,7 @@ export interface Agent {
    */
   unstable_didSaveDocument?(
     params: schema.DidSaveDocumentNotification,
-  ): Promise<void>;
+  ): MaybePromise<void>;
   /**
    * **UNSTABLE**: This capability is not part of the spec yet, and may be removed or changed at any point.
    *
@@ -2216,7 +3729,7 @@ export interface Agent {
    */
   unstable_didFocusDocument?(
     params: schema.DidFocusDocumentNotification,
-  ): Promise<void>;
+  ): MaybePromise<void>;
 
   /**
    * **UNSTABLE**: This capability is not part of the spec yet, and may be removed or changed at any point.
@@ -2225,7 +3738,7 @@ export interface Agent {
    *
    * @experimental
    */
-  unstable_acceptNes?(params: schema.AcceptNesNotification): Promise<void>;
+  unstable_acceptNes?(params: schema.AcceptNesNotification): MaybePromise<void>;
   /**
    * **UNSTABLE**: This capability is not part of the spec yet, and may be removed or changed at any point.
    *
@@ -2233,28 +3746,32 @@ export interface Agent {
    *
    * @experimental
    */
-  unstable_rejectNes?(params: schema.RejectNesNotification): Promise<void>;
+  unstable_rejectNes?(params: schema.RejectNesNotification): MaybePromise<void>;
 
   /**
-   * Extension method
+   * Handles a request that is not otherwise registered by the legacy agent.
    *
    * Allows the Client to send an arbitrary request that is not part of the ACP spec.
    *
    * To help avoid conflicts, it's a good practice to prefix extension
    * methods with a unique identifier such as domain name.
+   *
+   * @deprecated Prefer `agent().onRequest(...)` for custom methods.
    */
   extMethod?(
     method: string,
     params: Record<string, unknown>,
-  ): Promise<Record<string, unknown>>;
+  ): MaybePromise<Record<string, unknown>>;
 
   /**
-   * Extension notification
+   * Handles a notification that is not otherwise registered by the legacy agent.
    *
    * Allows the Client to send an arbitrary notification that is not part of the ACP spec.
+   *
+   * @deprecated Prefer `agent().onNotification(...)` for custom notifications.
    */
   extNotification?(
     method: string,
     params: Record<string, unknown>,
-  ): Promise<void>;
+  ): MaybePromise<void>;
 }

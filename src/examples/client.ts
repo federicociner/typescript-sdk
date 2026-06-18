@@ -114,47 +114,57 @@ async function main() {
     agentProcess.stdout!,
   ) as ReadableStream<Uint8Array>;
 
-  // Create the client connection
+  // Create the client handlers and connect to the agent
   const client = new ExampleClient();
   const stream = acp.ndJsonStream(input, output);
-  const connection = new acp.ClientSideConnection((_agent) => client, stream);
 
   try {
-    // Initialize the connection
-    const initResult = await connection.initialize({
-      protocolVersion: acp.PROTOCOL_VERSION,
-      clientCapabilities: {
-        fs: {
-          readTextFile: true,
-          writeTextFile: true,
-        },
-      },
-    });
+    const promptResult = await acp
+      .client({ name: "example-client" })
+      .onRequest(acp.methods.client.session.requestPermission, (c) =>
+        client.requestPermission(c.params),
+      )
+      .onRequest(acp.methods.client.fs.writeTextFile, (c) =>
+        client.writeTextFile(c.params),
+      )
+      .onRequest(acp.methods.client.fs.readTextFile, (c) =>
+        client.readTextFile(c.params),
+      )
+      .connectWith(stream, async (agent) => {
+        // Initialize the connection
+        const initResult = await agent.request(acp.methods.agent.initialize, {
+          protocolVersion: acp.PROTOCOL_VERSION,
+          clientCapabilities: {
+            fs: {
+              readTextFile: true,
+              writeTextFile: true,
+            },
+          },
+        });
 
-    console.log(
-      `✅ Connected to agent (protocol v${initResult.protocolVersion})`,
-    );
+        console.log(
+          `✅ Connected to agent (protocol v${initResult.protocolVersion})`,
+        );
 
-    // Create a new session
-    const sessionResult = await connection.newSession({
-      cwd: process.cwd(),
-      mcpServers: [],
-    });
+        return agent
+          .buildSession(process.cwd())
+          .withSession(async (session) => {
+            console.log(`📝 Created session: ${session.sessionId}`);
+            console.log(`💬 User: Hello, agent!\n`);
+            process.stdout.write(" ");
 
-    console.log(`📝 Created session: ${sessionResult.sessionId}`);
-    console.log(`💬 User: Hello, agent!\n`);
-    process.stdout.write(" ");
+            session.prompt("Hello, agent!");
 
-    // Send a test prompt
-    const promptResult = await connection.prompt({
-      sessionId: sessionResult.sessionId,
-      prompt: [
-        {
-          type: "text",
-          text: "Hello, agent!",
-        },
-      ],
-    });
+            for (;;) {
+              const message = await session.nextUpdate();
+              if (message.kind === "stop") {
+                return message.response;
+              }
+
+              await client.sessionUpdate(message.notification);
+            }
+          });
+      });
 
     console.log(`\n\n✅ Agent completed with: ${promptResult.stopReason}`);
   } catch (error) {

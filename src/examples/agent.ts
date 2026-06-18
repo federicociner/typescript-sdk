@@ -7,12 +7,10 @@ interface AgentSession {
   pendingPrompt: AbortController | null;
 }
 
-class ExampleAgent implements acp.Agent {
-  private connection: acp.AgentSideConnection;
+class ExampleAgent {
   private sessions: Map<string, AgentSession>;
 
-  constructor(connection: acp.AgentSideConnection) {
-    this.connection = connection;
+  constructor() {
     this.sessions = new Map();
   }
 
@@ -57,7 +55,10 @@ class ExampleAgent implements acp.Agent {
     return {};
   }
 
-  async prompt(params: acp.PromptRequest): Promise<acp.PromptResponse> {
+  async prompt(
+    params: acp.PromptRequest,
+    cx: acp.AgentContext,
+  ): Promise<acp.PromptResponse> {
     const session = this.sessions.get(params.sessionId);
 
     if (!session) {
@@ -68,7 +69,11 @@ class ExampleAgent implements acp.Agent {
     session.pendingPrompt = new AbortController();
 
     try {
-      await this.simulateTurn(params.sessionId, session.pendingPrompt.signal);
+      await this.simulateTurn(
+        params.sessionId,
+        session.pendingPrompt.signal,
+        cx,
+      );
     } catch (err) {
       if (session.pendingPrompt.signal.aborted) {
         return { stopReason: "cancelled" };
@@ -87,9 +92,10 @@ class ExampleAgent implements acp.Agent {
   private async simulateTurn(
     sessionId: string,
     abortSignal: AbortSignal,
+    cx: acp.AgentContext,
   ): Promise<void> {
     // Send initial text chunk
-    await this.connection.sessionUpdate({
+    await cx.notify(acp.methods.client.session.update, {
       sessionId,
       update: {
         sessionUpdate: "agent_message_chunk",
@@ -103,7 +109,7 @@ class ExampleAgent implements acp.Agent {
     await this.simulateModelInteraction(abortSignal);
 
     // Send a tool call that doesn't need permission
-    await this.connection.sessionUpdate({
+    await cx.notify(acp.methods.client.session.update, {
       sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -119,7 +125,7 @@ class ExampleAgent implements acp.Agent {
     await this.simulateModelInteraction(abortSignal);
 
     // Update tool call to completed
-    await this.connection.sessionUpdate({
+    await cx.notify(acp.methods.client.session.update, {
       sessionId,
       update: {
         sessionUpdate: "tool_call_update",
@@ -141,7 +147,7 @@ class ExampleAgent implements acp.Agent {
     await this.simulateModelInteraction(abortSignal);
 
     // Send more text
-    await this.connection.sessionUpdate({
+    await cx.notify(acp.methods.client.session.update, {
       sessionId,
       update: {
         sessionUpdate: "agent_message_chunk",
@@ -155,7 +161,7 @@ class ExampleAgent implements acp.Agent {
     await this.simulateModelInteraction(abortSignal);
 
     // Send a tool call that DOES need permission
-    await this.connection.sessionUpdate({
+    await cx.notify(acp.methods.client.session.update, {
       sessionId,
       update: {
         sessionUpdate: "tool_call",
@@ -172,32 +178,35 @@ class ExampleAgent implements acp.Agent {
     });
 
     // Request permission for the sensitive operation
-    const permissionResponse = await this.connection.requestPermission({
-      sessionId,
-      toolCall: {
-        toolCallId: "call_2",
-        title: "Modifying critical configuration file",
-        kind: "edit",
-        status: "pending",
-        locations: [{ path: "/home/user/project/config.json" }],
-        rawInput: {
-          path: "/home/user/project/config.json",
-          content: '{"database": {"host": "new-host"}}',
+    const permissionResponse = await cx.request(
+      acp.methods.client.session.requestPermission,
+      {
+        sessionId,
+        toolCall: {
+          toolCallId: "call_2",
+          title: "Modifying critical configuration file",
+          kind: "edit",
+          status: "pending",
+          locations: [{ path: "/home/user/project/config.json" }],
+          rawInput: {
+            path: "/home/user/project/config.json",
+            content: '{"database": {"host": "new-host"}}',
+          },
         },
+        options: [
+          {
+            kind: "allow_once",
+            name: "Allow this change",
+            optionId: "allow",
+          },
+          {
+            kind: "reject_once",
+            name: "Skip this change",
+            optionId: "reject",
+          },
+        ],
       },
-      options: [
-        {
-          kind: "allow_once",
-          name: "Allow this change",
-          optionId: "allow",
-        },
-        {
-          kind: "reject_once",
-          name: "Skip this change",
-          optionId: "reject",
-        },
-      ],
-    });
+    );
 
     if (permissionResponse.outcome.outcome === "cancelled") {
       return;
@@ -205,7 +214,7 @@ class ExampleAgent implements acp.Agent {
 
     switch (permissionResponse.outcome.optionId) {
       case "allow": {
-        await this.connection.sessionUpdate({
+        await cx.notify(acp.methods.client.session.update, {
           sessionId,
           update: {
             sessionUpdate: "tool_call_update",
@@ -217,7 +226,7 @@ class ExampleAgent implements acp.Agent {
 
         await this.simulateModelInteraction(abortSignal);
 
-        await this.connection.sessionUpdate({
+        await cx.notify(acp.methods.client.session.update, {
           sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
@@ -232,7 +241,7 @@ class ExampleAgent implements acp.Agent {
       case "reject": {
         await this.simulateModelInteraction(abortSignal);
 
-        await this.connection.sessionUpdate({
+        await cx.notify(acp.methods.client.session.update, {
           sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
@@ -273,4 +282,14 @@ const input = Writable.toWeb(process.stdout);
 const output = Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>;
 
 const stream = acp.ndJsonStream(input, output);
-new acp.AgentSideConnection((conn) => new ExampleAgent(conn), stream);
+const agent = new ExampleAgent();
+
+acp
+  .agent({ name: "example-agent" })
+  .onRequest("initialize", (c) => agent.initialize(c.params))
+  .onRequest("session/new", (c) => agent.newSession(c.params))
+  .onRequest("authenticate", (c) => agent.authenticate(c.params))
+  .onRequest("session/set_mode", (c) => agent.setSessionMode(c.params))
+  .onRequest("session/prompt", (c) => agent.prompt(c.params, c.client))
+  .onNotification("session/cancel", (c) => agent.cancel(c.params))
+  .connect(stream);
