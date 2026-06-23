@@ -222,6 +222,15 @@ type ConnectionPendingResponse = {
 export type MaybePromise<T> = T | Promise<T>;
 
 /**
+ * Allocates IDs for JSON-RPC requests sent by this connection.
+ *
+ * The default generator is a per-connection numeric sequence starting at `0`.
+ * HTTP server integrations can inject a custom generator so server-originated
+ * request IDs remain unique across distributed server instances.
+ */
+export type JsonRpcRequestIdGenerator = () => string | number;
+
+/**
  * Incoming request passed to JSON-RPC handlers.
  */
 export type IncomingRequest = {
@@ -610,6 +619,13 @@ export type ConnectionOptions = {
    * Extra handlers to prepend to the connection's handler chain.
    */
   handlers?: JsonRpcHandler[];
+
+  /**
+   * Allocates IDs for outbound JSON-RPC requests.
+   *
+   * Defaults to the existing per-connection numeric sequence: 0, 1, 2, ...
+   */
+  requestIdGenerator?: JsonRpcRequestIdGenerator;
 };
 
 /**
@@ -623,6 +639,8 @@ export class Connection {
     new Map();
   private incomingRequests: Map<JsonRpcId, AbortController> = new Map();
   private nextRequestId = 0;
+  private requestIdGenerator: JsonRpcRequestIdGenerator = () =>
+    this.nextRequestId++;
   private staticHandlers: JsonRpcHandler[] = [];
   private dynamicHandlers: Set<JsonRpcHandler> = new Set();
   private stream!: Stream;
@@ -655,20 +673,25 @@ export class Connection {
       const notificationHandler =
         notificationHandlerOrHandlers as NotificationHandler;
       const stream = streamOrOptions as Stream;
-      this.initialize(stream, [
-        ...(options?.handlers ?? []),
-        this.legacyHandler(requestHandler, notificationHandler),
-      ]);
+      this.initialize(
+        stream,
+        [
+          ...(options?.handlers ?? []),
+          this.legacyHandler(requestHandler, notificationHandler),
+        ],
+        options,
+      );
       return;
     }
 
     const stream = requestHandlerOrStream;
     const handlers = notificationHandlerOrHandlers as JsonRpcHandler[];
     const connectionOptions = streamOrOptions as ConnectionOptions | undefined;
-    this.initialize(stream, [
-      ...(connectionOptions?.handlers ?? []),
-      ...handlers,
-    ]);
+    this.initialize(
+      stream,
+      [...(connectionOptions?.handlers ?? []), ...handlers],
+      connectionOptions,
+    );
   }
 
   /**
@@ -760,7 +783,7 @@ export class Connection {
       return rejectedPromise(this.closedReason());
     }
 
-    const id = this.nextRequestId++;
+    const id = this.requestIdGenerator();
     let cancel = () => {};
     const responsePromise = new Promise<Output>((resolve, reject) => {
       const pendingResponse: ConnectionPendingResponse = {
@@ -849,9 +872,15 @@ export class Connection {
     void this.receiveReader?.cancel(closeError).catch(() => {});
   }
 
-  private initialize(stream: Stream, handlers: JsonRpcHandler[]): void {
+  private initialize(
+    stream: Stream,
+    handlers: JsonRpcHandler[],
+    options?: ConnectionOptions,
+  ): void {
     this.stream = stream;
     this.staticHandlers = handlers;
+    this.requestIdGenerator =
+      options?.requestIdGenerator ?? (() => this.nextRequestId++);
     this.closedPromise = new Promise((resolve) => {
       this.abortController.signal.addEventListener("abort", () => resolve());
     });
